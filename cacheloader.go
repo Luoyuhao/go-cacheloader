@@ -37,6 +37,18 @@ type lastWriteMeta struct {
 	LastWriteTime time.Time // 上次写缓存时间
 }
 
+func (cl *CacheLoader) GetCacheHandler() Cacher {
+	return cl.cacheHandler
+}
+
+func (cl *CacheLoader) GetLoadHandler() Loader {
+	return cl.loadHandler
+}
+
+func (cl *CacheLoader) GetLockHandler() Locker {
+	return cl.lockHandler
+}
+
 // 查询数据。对应某个key数据不存在时，返回值为nil。
 // @ctx：上下文
 // @key：缓存keys
