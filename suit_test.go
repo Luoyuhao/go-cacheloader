@@ -6,9 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Luoyuhao/go-cacheloader/helper"
 	"github.com/stretchr/testify/suite"
-
-	"github.com/Luoyuhao/go-cacheloader/internal"
 )
 
 // Define the suite, and absorb the built-in basic suite
@@ -27,7 +26,7 @@ type Suite struct {
 // Make sure that VariableThatShouldStartAtFive is set to five
 // before each test
 func (suite *Suite) SetupSuite() {
-	internal.DebugOn()
+	helper.DebugOn()
 	cImpl := &cacherImpl{KVMap: &sync.Map{}, mutex: &sync.Mutex{}}
 	suite.cacher = cImpl
 	suite.locker = cImpl
@@ -41,12 +40,12 @@ func (suite *Suite) SetupSuite() {
 			select {
 			case <-milSecondTimer.C:
 				cImpl.KVMap.Range(func(key, value interface{}) bool {
-					rawVal := value.(*cacheVal)
+					rawVal := value.(*strCacheVal)
 					if rawVal.dueTime.Before(time.Now()) {
 						cImpl.mutex.Lock()
 						defer cImpl.mutex.Unlock()
 						if value, ok := cImpl.KVMap.Load(key); ok {
-							rawVal := value.(*cacheVal)
+							rawVal := value.(*strCacheVal)
 							if rawVal.dueTime.Before(time.Now()) {
 								cImpl.KVMap.Delete(key)
 							}
@@ -91,29 +90,32 @@ type cacherImpl struct {
 	mutex *sync.Mutex
 }
 
-type cacheVal struct {
-	val     []byte
+type strCacheVal struct {
+	val     string
 	dueTime time.Time
 }
 
 func (c *cacherImpl) TimeLock(_ context.Context, key string, duration time.Duration) (bool, error) {
-	_, locked := c.KVMap.LoadOrStore("lock-"+key, &cacheVal{
-		val:     nil,
+	_, locked := c.KVMap.LoadOrStore("lock-"+key, &strCacheVal{
+		val:     "",
 		dueTime: time.Now().Add(duration),
 	})
 	return !locked, nil
 }
 
-func (c *cacherImpl) Get(ctx context.Context, key string) ([]byte, error) {
-	resultList, _ := c.MGet(ctx, key)
-	return resultList[0], nil
+func (c *cacherImpl) Get(ctx context.Context, key string) (string, error) {
+	if val, ok := c.KVMap.Load(key); ok {
+		rawVal := val.(*strCacheVal)
+		return rawVal.val, nil
+	}
+	return "", ErrNotFound
 }
 
-func (c *cacherImpl) MGet(_ context.Context, keys ...string) ([][]byte, error) {
-	resultList := make([][]byte, 0, len(keys))
+func (c *cacherImpl) MGet(_ context.Context, keys ...string) ([]interface{}, error) {
+	resultList := make([]interface{}, 0, len(keys))
 	for _, key := range keys {
 		if val, ok := c.KVMap.Load(key); ok {
-			rawVal := val.(*cacheVal)
+			rawVal := val.(*strCacheVal)
 			resultList = append(resultList, rawVal.val)
 			continue
 		}
@@ -122,11 +124,15 @@ func (c *cacherImpl) MGet(_ context.Context, keys ...string) ([][]byte, error) {
 	return resultList, nil
 }
 
-func (c *cacherImpl) Set(_ context.Context, key string, val []byte, ttl time.Duration) error {
+func (c *cacherImpl) Set(_ context.Context, key string, val interface{}, ttl time.Duration) error {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
-	c.KVMap.Store(key, &cacheVal{
-		val:     val,
+	strVal, err := helper.JSONMarshal(val)
+	if err != nil {
+		return err
+	}
+	c.KVMap.Store(key, &strCacheVal{
+		val:     string(strVal),
 		dueTime: time.Now().Add(ttl),
 	})
 	return nil
@@ -134,7 +140,7 @@ func (c *cacherImpl) Set(_ context.Context, key string, val []byte, ttl time.Dur
 
 func (c *cacherImpl) TTL(_ context.Context, key string) (time.Duration, error) {
 	if val, ok := c.KVMap.Load(key); ok {
-		rawVal := val.(*cacheVal)
+		rawVal := val.(*strCacheVal)
 		return time.Until(rawVal.dueTime), nil
 	}
 	return 0, nil
@@ -145,16 +151,16 @@ type loaderImpl struct {
 	KVMap *sync.Map
 }
 
-func (l *loaderImpl) Load(ctx context.Context, key string) ([]byte, error) {
+func (l *loaderImpl) Load(ctx context.Context, key string) (interface{}, error) {
 	resultList, _ := l.Loads(ctx, key)
 	return resultList[0], nil
 }
 
-func (l *loaderImpl) Loads(_ context.Context, keys ...string) ([][]byte, error) {
-	resultList := make([][]byte, 0, len(keys))
+func (l *loaderImpl) Loads(_ context.Context, keys ...string) ([]interface{}, error) {
+	resultList := make([]interface{}, 0, len(keys))
 	for _, key := range keys {
 		if val, ok := l.KVMap.Load(key); ok {
-			rawVal := val.([]byte)
+			rawVal := val.(interface{})
 			resultList = append(resultList, rawVal)
 			continue
 		}
@@ -163,7 +169,7 @@ func (l *loaderImpl) Loads(_ context.Context, keys ...string) ([][]byte, error) 
 	return resultList, nil
 }
 
-func (l *loaderImpl) Store(_ context.Context, key string, val []byte) error {
+func (l *loaderImpl) Store(_ context.Context, key string, val interface{}) error {
 	l.KVMap.Store(key, val)
 	return nil
 }
@@ -175,7 +181,7 @@ type sleepLoaderImpl struct {
 	rwLock       *sync.RWMutex
 }
 
-func (l *sleepLoaderImpl) Load(ctx context.Context, key string) ([]byte, error) {
+func (l *sleepLoaderImpl) Load(ctx context.Context, key string) (interface{}, error) {
 	resultList, err := l.Loads(ctx, key)
 	if err != nil {
 		return nil, err
@@ -183,7 +189,7 @@ func (l *sleepLoaderImpl) Load(ctx context.Context, key string) ([]byte, error) 
 	return resultList[0], nil
 }
 
-func (l *sleepLoaderImpl) Loads(ctx context.Context, keys ...string) ([][]byte, error) {
+func (l *sleepLoaderImpl) Loads(ctx context.Context, keys ...string) ([]interface{}, error) {
 	complete := make(chan struct{})
 	done := ctx.Done()
 	if done == nil {
@@ -191,7 +197,7 @@ func (l *sleepLoaderImpl) Loads(ctx context.Context, keys ...string) ([][]byte, 
 	}
 
 	var (
-		resultList [][]byte
+		resultList []interface{}
 		err        error
 	)
 	go func() {
@@ -207,8 +213,8 @@ func (l *sleepLoaderImpl) Loads(ctx context.Context, keys ...string) ([][]byte, 
 	}
 }
 
-func (l *sleepLoaderImpl) loads(_ context.Context, keys ...string) ([][]byte, error) {
-	resultList := make([][]byte, 0, len(keys))
+func (l *sleepLoaderImpl) loads(_ context.Context, keys ...string) ([]interface{}, error) {
+	resultList := make([]interface{}, 0, len(keys))
 	for _, key := range keys {
 		if val, ok := l.KVMap.Load(key); ok {
 			l.rwLock.RLock()
@@ -221,7 +227,7 @@ func (l *sleepLoaderImpl) loads(_ context.Context, keys ...string) ([][]byte, er
 			l.notFirstLoad = true
 			l.rwLock.Unlock()
 
-			rawVal := val.([]byte)
+			rawVal := val.(interface{})
 			resultList = append(resultList, rawVal)
 			continue
 		}
@@ -231,7 +237,7 @@ func (l *sleepLoaderImpl) loads(_ context.Context, keys ...string) ([][]byte, er
 	return resultList, nil
 }
 
-func (l *sleepLoaderImpl) Store(_ context.Context, key string, val []byte) error {
+func (l *sleepLoaderImpl) Store(_ context.Context, key string, val interface{}) error {
 	l.KVMap.Store(key, val)
 	return nil
 }
@@ -243,15 +249,17 @@ func (c *panicCacherImpl) TimeLock(_ context.Context, _ string, _ time.Duration)
 	return true, nil
 }
 
-func (c *panicCacherImpl) Get(_ context.Context, _ string) ([]byte, error) {
-	return []byte{}, nil
+func (c *panicCacherImpl) Get(_ context.Context, _ string) (string, error) {
+	sample := &testStruct{}
+	result, err := helper.JSONMarshal(sample)
+	return string(result), err
 }
 
-func (c *panicCacherImpl) MGet(_ context.Context, _ ...string) ([][]byte, error) {
-	return [][]byte{}, nil
+func (c *panicCacherImpl) MGet(_ context.Context, _ ...string) ([]interface{}, error) {
+	return []interface{}{}, nil
 }
 
-func (c *panicCacherImpl) Set(_ context.Context, _ string, _ []byte, _ time.Duration) error {
+func (c *panicCacherImpl) Set(_ context.Context, _ string, _ interface{}, _ time.Duration) error {
 	return nil
 }
 

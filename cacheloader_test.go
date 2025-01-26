@@ -2,19 +2,17 @@ package cacheloader
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
 
+	"github.com/Luoyuhao/go-cacheloader/helper"
 	"go.uber.org/atomic"
-
-	"github.com/Luoyuhao/go-cacheloader/internal"
 )
 
 type testStruct struct {
-	Name  string
-	Value int64
+	Name  string `json:"name"`
+	Value int64  `json:"value"`
 }
 
 var emptyErr = fmt.Errorf("")
@@ -27,7 +25,7 @@ var emptyErr = fmt.Errorf("")
 func (suite *Suite) Test_Usage() {
 	ctx := context.Background()
 	// CASE1：builder模式创建CacheLoader实例
-	clr, err := NewBuilder().
+	clr, err := NewBuilder[*testStruct]().
 		RefreshAfterWriteSec(uint64(1)).
 		TTLSec(uint64(3)).
 		TTLSec4Invalid(uint64(2)).
@@ -52,16 +50,14 @@ func (suite *Suite) Test_Usage() {
 	// CASE3：数据源存在数据，初次回源，返回回源值，缓存回源值。
 	key1 := "test1"
 	key2 := "test2"
-	rawVal1 := &testStruct{
+	val1 := &testStruct{
 		Name:  key1,
 		Value: 1,
 	}
-	val1, _ := json.Marshal(rawVal1)
-	rawVal2 := &testStruct{
+	val2 := &testStruct{
 		Name:  key2,
 		Value: 2,
 	}
-	val2, _ := json.Marshal(rawVal2)
 	loader := (suite.loader).(*loaderImpl)
 	err = loader.Store(ctx, key1, val1) // 存入数据
 	suite.NoError(err)
@@ -72,13 +68,10 @@ func (suite *Suite) Test_Usage() {
 	suite.NoError(err)
 	suite.Equal(2, len(resultList))
 	for _, result := range resultList {
-		rawResult := &testStruct{}
-		err = json.Unmarshal(result, rawResult)
-		suite.NoError(err)
-		if rawResult.Name == key1 {
-			suite.Equal(rawResult, rawVal1)
-		} else if rawResult.Name == key2 {
-			suite.Equal(rawResult, rawVal2)
+		if result.Name == key1 {
+			suite.Equal(*val1, *result)
+		} else if result.Name == key2 {
+			suite.Equal(*val2, *result)
 		} else {
 			suite.NoError(fmt.Errorf("未符合预期命中数据"))
 		}
@@ -90,11 +83,10 @@ func (suite *Suite) Test_Usage() {
 		ended      atomic.Bool
 	)
 	start = time.Now()
-	rawValUpdated := &testStruct{
+	valUpdated := &testStruct{
 		Name:  "babaaba",
 		Value: 3,
 	}
-	valUpdated, _ := json.Marshal(rawValUpdated)
 	err = loader.Store(ctx, key1, valUpdated) // 更新数据源中key1对应的值
 	suite.NoError(err)
 	group := &sync.WaitGroup{}
@@ -110,13 +102,10 @@ func (suite *Suite) Test_Usage() {
 				<-milSecondTimer.C
 				result, err := clr.Get(ctx, key1)
 				suite.NoError(err)
-				rawResult := &testStruct{}
-				err = json.Unmarshal(result, rawResult)
-				suite.NoError(err)
-				if *rawResult == *rawVal1 {
+				if *result == *val1 {
 					continue
-				} else if *rawResult == *rawValUpdated {
-					if ended.CAS(false, true) {
+				} else if *result == *valUpdated {
+					if ended.CompareAndSwap(false, true) {
 						end = time.Now() // 缓存更新时设置结束时间并退出
 					}
 					break
@@ -134,30 +123,30 @@ func (suite *Suite) Test_Usage() {
 	fmt.Println(end.Sub(start))
 }
 
-// cacher返回值语义约定：存入nil->nil，存入[]byte{}->[]byte{}
-func (suite *Suite) Test_CacherImpl() {
-	// []byte{}
-	ctx := context.Background()
-	err := suite.cacher.Set(ctx, "test_1", []byte{}, 1*time.Second)
-	suite.NoError(err)
+// // cacher返回值语义约定：存入nil->nil，存入[]byte{}->[]byte{}
+// func (suite *Suite) Test_CacherImpl() {
+// 	// []byte{}
+// 	ctx := context.Background()
+// 	err := suite.cacher.Set(ctx, "test_1", []byte{}, 1*time.Second)
+// 	suite.NoError(err)
 
-	result, err := suite.cacher.Get(ctx, "test_1")
-	suite.NoError(err)
-	suite.Equal([]byte{}, result)
+// 	result, err := suite.cacher.Get(ctx, "test_1")
+// 	suite.NoError(err)
+// 	suite.Equal([]byte{}, result)
 
-	// nil
-	err = suite.cacher.Set(ctx, "test_2", nil, 1*time.Second)
-	suite.NoError(err)
+// 	// nil
+// 	err = suite.cacher.Set(ctx, "test_2", nil, 1*time.Second)
+// 	suite.NoError(err)
 
-	result, err = suite.cacher.Get(ctx, "test_2")
-	suite.NoError(err)
-	suite.Nil(result)
-}
+// 	result, err = suite.cacher.Get(ctx, "test_2")
+// 	suite.NoError(err)
+// 	suite.Nil(result)
+// }
 
 // 触发panic的资源释放顺序
 func (suite *Suite) Test_Panic() {
 	ctx := context.Background()
-	clr, err := NewBuilder().
+	clr, err := NewBuilder[*testStruct]().
 		TTLSec(uint64(5)).
 		RefreshAfterWriteSec(uint64(1)).
 		RefreshTimeout(10 * time.Second).
@@ -171,14 +160,14 @@ func (suite *Suite) Test_Panic() {
 	suite.NoError(err)
 
 	time.Sleep(10 * time.Millisecond) // 停顿1s 若自动更新过程发生panic会记录error
-	suite.NotEqual(emptyErr, (internal.Err4Debug.Load()).(error))
-	internal.Err4Debug.Store(emptyErr)
+	suite.NotEqual(emptyErr, (helper.Err4Debug.Load()).(error))
+	helper.Err4Debug.Store(emptyErr)
 }
 
 // 设置自动回源超时
 func (suite *Suite) Test_LoadTimeout() {
 	ctx := context.Background()
-	clr, err := NewBuilder().
+	clr, err := NewBuilder[*testStruct]().
 		TTLSec(uint64(5)).
 		RefreshAfterWriteSec(uint64(1)).
 		RefreshTimeout(100 * time.Millisecond). // 设置自动更新100ms超时
@@ -188,36 +177,35 @@ func (suite *Suite) Test_LoadTimeout() {
 	suite.NoError(err)
 
 	key := "Test_LoadTimeout"
-	rawVal := &testStruct{
+	val := &testStruct{
 		Name:  key,
 		Value: 2,
 	}
-	val, _ := json.Marshal(rawVal)
 	loader := (suite.sleepLoader).(*sleepLoaderImpl)
 	err = loader.Store(ctx, key, val) // 存入数据
 	suite.NoError(err)
 	result, err := clr.Get(ctx, key)
 	suite.NoError(err)
-	suite.Equal(val, result)
+	suite.Equal(*val, *result)
 
 	time.Sleep(1100 * time.Millisecond) // 停顿1.1s在下次Get的时候触发自动更新
 
 	start := time.Now()
 	result, err = clr.Get(ctx, key)
 	suite.NoError(err)
-	suite.Equal(val, result)
+	suite.Equal(*val, *result)
 	suite.True(time.Since(start) < 10*time.Millisecond)
 
 	time.Sleep(200 * time.Millisecond) // 停顿1s 若自动更新过程发生超时则会记录error
-	suite.NotEqual(emptyErr, (internal.Err4Debug.Load()).(error))
-	internal.Err4Debug.Store(emptyErr)
+	suite.NotEqual(emptyErr, (helper.Err4Debug.Load()).(error))
+	helper.Err4Debug.Store(emptyErr)
 }
 
 // 测试metaCache的长度有限性
 func (suite *Suite) Test_metaCache() {
 	ctx := context.Background()
 
-	clr, err := NewBuilder().
+	clr, err := NewBuilder[*testStruct]().
 		TTLSec(uint64(5)).
 		RefreshAfterWriteSec(uint64(1)).
 		MetaCacheMaxLen(1).
@@ -230,38 +218,36 @@ func (suite *Suite) Test_metaCache() {
 	loader := (suite.sleepLoader).(*sleepLoaderImpl)
 
 	key1 := "test_metacache_limit_1"
-	rawval1 := &testStruct{
+	val1 := &testStruct{
 		Name:  key1,
 		Value: 1,
 	}
 
-	val, _ := json.Marshal(rawval1)
-	err = loader.Store(ctx, key1, val) // 存入数据 sleepLoaderImpl KVMap
+	err = loader.Store(ctx, key1, val1) // 存入数据 sleepLoaderImpl KVMap
 	suite.NoError(err)
 	result1, err := clr.Get(ctx, key1) // 触发回源，key写入值, 写入lru cache
 	suite.NoError(err)
-	suite.Equal(val, result1)
+	suite.Equal(*val1, *result1)
 
 	time.Sleep(1100 * time.Millisecond) // 停顿1.1s在下次Get的时候触发自动更新
 
 	start := time.Now()
 	result1, err = clr.Get(ctx, key1) // 触发自动更新, 读取lru cache
 	suite.NoError(err)
-	suite.Equal(val, result1)
+	suite.Equal(*val1, *result1)
 	suite.True(time.Since(start) < 10*time.Millisecond)
 
 	key2 := "test_metacache_limit_2"
-	rawval2 := &testStruct{
+	val2 := &testStruct{
 		Name:  key2,
 		Value: 2,
 	}
 
-	val2, _ := json.Marshal(rawval2)
 	err = loader.Store(ctx, key2, val2) // 存入数据 sleepLoaderImpl KVMap
 	suite.NoError(err)
 	result, err := clr.Get(ctx, key2) // 触发回源，key写入值, 写入lru cache
 	suite.NoError(err)
-	suite.Equal(val2, result)
+	suite.Equal(*val2, *result)
 
 	clr.rwLock.RLock()
 	suite.Equal(1, clr.metaCache.Len())

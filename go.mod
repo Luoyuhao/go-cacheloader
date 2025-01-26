@@ -3,6 +3,7 @@ module github.com/Luoyuhao/go-cacheloader
 go 1.23.4
 
 require (
+	github.com/goccy/go-json v0.10.4
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8
 	github.com/sirupsen/logrus v1.9.3
 	github.com/stretchr/testify v1.10.0

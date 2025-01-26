@@ -2,15 +2,12 @@ package cacheloader
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"reflect"
 	"sync"
 	"time"
 
+	"github.com/Luoyuhao/go-cacheloader/helper"
 	"github.com/golang/groupcache/lru"
-
-	"github.com/Luoyuhao/go-cacheloader/internal"
 )
 
 const (
@@ -18,17 +15,15 @@ const (
 	invalidValue = "CacheLoader-invalid-cache-value" // 源数据不存在时，为防雪崩在cache中缓存的无效值
 )
 
-var ErrDowngraded = errors.New("CacheLoader downgraded")
-
 func zero[T any]() T {
 	var zero T
 	return zero
 }
 
 /************************ CacheLoader structure ************************/
-type CacheLoader[T any] struct {
-	cacheHandler         Cacher[T]     // 缓存处理器
-	loadHandler          Loader[T]     // 回源处理器
+type CacheLoader[T comparable] struct {
+	cacheHandler         Cacher        // 缓存处理器
+	loadHandler          Loader        // 回源处理器
 	lockHandler          Locker        // 分布式锁处理器
 	refreshAfterWriteSec uint64        // 距离上次写缓存后触发自动更新的最小时间间隔（单位：s）：0代表不执行自动更新
 	ttlSec               uint64        // 缓存有效时长（单位：s）：0代表缓存不过期
@@ -50,32 +45,41 @@ func (cl *CacheLoader[T]) MGet(ctx context.Context, keys ...string) ([]T, error)
 	if len(keys) == 0 {
 		return []T{}, nil
 	}
-	if internal.Downgraded() {
+	if helper.Downgraded() {
 		return nil, ErrDowngraded
 	}
+
+	var resultList []T
 	// 1 查询缓存
-	resultList, err := cl.cacheHandler.MGet(ctx, keys...)
+	cacheResults, err := cl.cacheHandler.MGet(ctx, keys...)
 	if err != nil {
-		internal.Warn(ctx, fmt.Errorf("CacheLoader fail to execute MGet in Cacher implement, keys: %v, err: %v", keys, err))
+		helper.Warn(ctx, fmt.Errorf("fail to execute MGet in Cacher implement, keys: %v, err: %v", keys, err))
 		resultList = make([]T, len(keys))
+	} else {
+		resultList = make([]T, len(cacheResults))
 	}
 	if len(resultList) != len(keys) {
-		return nil, fmt.Errorf("lenght of result list, returned by MGet in Cacher implement, did not match length of keys param, please checkout implement gideline")
+		err = fmt.Errorf("lenght of result list, returned by MGet in Cacher implement, did not match length of keys param, please checkout implement gideline")
+		helper.Err(ctx, err)
+		return nil, err
 	}
-	missCacheKeys := make([]string, 0, len(resultList))
-	missCacheIndexes := make([]int, 0, len(resultList))
-	for i := 0; i < len(resultList); i++ {
-		if reflect.TypeOf(resultList[i]).Kind() == reflect.String {
-			// 无效值过滤：无效值返回给用户nil
-			if fmt.Sprintf("%s", resultList[i]) == invalidValue {
-				resultList[i] = zero[T]()
-			}
-			// 2 缓存命中则触发自动更新
-			cl.triggerCacheRefresh(ctx, keys[i])
+	missCacheKeys := make([]string, 0, len(cacheResults))
+	missCacheIndexes := make([]int, 0, len(cacheResults))
+	for i := 0; i < len(cacheResults); i++ {
+		if cacheResults[i] == nil {
+			missCacheKeys = append(missCacheKeys, keys[i])
+			missCacheIndexes = append(missCacheIndexes, i)
 			continue
 		}
-		missCacheKeys = append(missCacheKeys, keys[i])
-		missCacheIndexes = append(missCacheIndexes, i)
+
+		result, err := cl.cvtStrTypeCacheData(ctx, cacheResults[i])
+		if err != nil {
+			return nil, err
+		}
+		resultList[i] = result
+
+		// 2 缓存命中则触发自动更新
+		cl.triggerCacheRefresh(ctx, keys[i])
 	}
 	if len(missCacheKeys) == 0 {
 		return resultList, nil
@@ -96,22 +100,23 @@ func (cl *CacheLoader[T]) MGet(ctx context.Context, keys ...string) ([]T, error)
 // @ctx：上下文
 // @key：缓存key
 func (cl *CacheLoader[T]) Get(ctx context.Context, key string) (T, error) {
-	if internal.Downgraded() {
+	if helper.Downgraded() {
 		return zero[T](), ErrDowngraded
 	}
 	// 1 查询缓存
 	data, err := cl.cacheHandler.Get(ctx, key)
-	if err != nil {
-		internal.Warn(ctx, fmt.Errorf("CacheLoader fail to execute Get in Cacher implement, key: %s, err: %v", key, err))
+	if err != nil && err != ErrNotFound {
+		helper.Warn(ctx, fmt.Errorf("CacheLoader fail to execute Get in Cacher implement, key: %s, err: %v", key, err))
 	}
-	if data != nil {
-		// 无效值过滤: 无效值返回给用户nil
-		if fmt.Sprintf("%s", data) == invalidValue {
-			data = zero[T]()
+
+	if err == nil {
+		result, err := cl.cvtStrTypeCacheData(ctx, data)
+		if err != nil {
+			return zero[T](), err
 		}
 		// 2 缓存命中则触发自动更新
 		cl.triggerCacheRefresh(ctx, key)
-		return data, nil
+		return result, nil
 	}
 
 	// 3 未命中缓存则回源
@@ -122,33 +127,62 @@ func (cl *CacheLoader[T]) Get(ctx context.Context, key string) (T, error) {
 	return dataList[0], nil
 }
 
+func (cl *CacheLoader[T]) cvtStrTypeCacheData(ctx context.Context, cacheData interface{}) (T, error) {
+	var data T
+	switch raw := cacheData.(type) {
+	case string:
+		// 无效值过滤：无效值返回给用户nil
+		if raw == invalidValue {
+			return zero[T](), nil
+		}
+		err := helper.JSONUnmarshal([]byte(raw), &data)
+		if err != nil {
+			helper.Err(ctx, fmt.Errorf("fail to execute JSONUnmarshal, err: %v", err))
+			return zero[T](), err
+		}
+		return data, nil
+	case []byte:
+		if string(raw) == invalidValue {
+			return zero[T](), nil
+		}
+		err := helper.JSONUnmarshal(raw, &data)
+		if err != nil {
+			helper.Err(ctx, fmt.Errorf("fail to execute JSONUnmarshal, err: %v", err))
+			return zero[T](), err
+		}
+		return data, nil
+	}
+	err := fmt.Errorf("unsupported cache data type: %T", cacheData)
+	helper.Err(ctx, err)
+	return zero[T](), err
+}
+
 // 触发自动更新缓存。
 // @ctx：上下文
 // @key：缓存key
 func (cl *CacheLoader[T]) triggerCacheRefresh(ctx context.Context, key string) {
-	if cl.refreshAfterWriteSec == 0 {
+	if cl.refreshAfterWriteSec <= 0 { // refreshAfterWriteSec为零值时不自动更新缓存
 		if cl.debug {
-			internal.Debug(ctx, fmt.Sprintf("CLR no need to trigger cache refresh, cl: %v", *cl))
+			helper.Debug(ctx, fmt.Sprintf("CLR no need to trigger cache refresh, cl: %v", *cl))
 		}
-		// refreshAfterWriteSec为零值时不自动更新缓存
 		return
 	}
 
 	go func(ctx context.Context, key string) {
 		timeoutCtx, cancel := context.WithTimeout(ctx, cl.refreshTimeout)
-		internal.AskForToken()
-		defer internal.RecoverAndLog(timeoutCtx)
+		helper.AskForToken()
+		defer helper.RecoverAndLog(timeoutCtx)
 		defer func() {
 			cancel()
-			internal.ReturnToken()
+			helper.ReturnToken()
 		}()
 		ok := cl.rwLockAndResetMeta(key)
 		if !ok {
 			return
 		}
-		err := cl.lockAndCache(timeoutCtx, key, nil, true)
+		err := cl.lockAndCache(timeoutCtx, key, zero[T](), true)
 		if err != nil {
-			internal.Warn(timeoutCtx, fmt.Errorf("CacheLoader fail to set cache when triggerCacheRefresh, key: %s, err: %v", key, err))
+			helper.Warn(timeoutCtx, fmt.Errorf("CacheLoader fail to set cache when triggerCacheRefresh, key: %s, err: %v", key, err))
 		}
 	}(context.Background(), key)
 }
@@ -161,42 +195,58 @@ func (cl *CacheLoader[T]) triggerLoadAndCache(ctx context.Context, keys ...strin
 		return []T{}, nil
 	}
 	// 回源
-	sourceDataList := make([]T, 0)
+	sourceDataList := make([]interface{}, 0)
 	var err error
 	if len(keys) == 1 {
 		sourceData, err := cl.loadHandler.Load(ctx, keys[0])
 		if err != nil {
-			return zero[T](), err
+			return nil, err
 		}
 		sourceDataList = append(sourceDataList, sourceData)
 	} else {
 		sourceDataList, err = cl.loadHandler.Loads(ctx, keys...)
 		if err != nil {
-			return zero[T](), err
+			return nil, err
 		}
 		if len(sourceDataList) != len(keys) {
-			return zero[T](), fmt.Errorf("lenght of result list, returned by Loads in Loader implement, did not match length of keys param, please checkout implement gideline")
+			err = fmt.Errorf("lenght of result list, returned by Loads in Loader implement, did not match length of keys param, please checkout implement gideline")
+			helper.Err(ctx, err)
+			return nil, err
 		}
 	}
 
 	// 异步设置缓存
 	for i := 0; i < len(sourceDataList); i++ {
-		go func(ctx context.Context, key string, val T) {
-			internal.AskForToken()
-			defer internal.RecoverAndLog(ctx)
-			defer internal.ReturnToken()
+		go func(ctx context.Context, key string, val interface{}) {
+			helper.AskForToken()
+			defer helper.RecoverAndLog(ctx)
+			defer helper.ReturnToken()
 			ok := cl.wLockAndResetMeta(key)
 			if !ok {
 				return
 			}
 			err := cl.lockAndCache(ctx, key, val, false)
 			if err != nil {
-				internal.Warn(ctx, fmt.Errorf("CacheLoader fail to set cache when triggerLoadAndCache, key: %s, err: %v", key, err))
+				helper.Warn(ctx, fmt.Errorf("CacheLoader fail to set cache when triggerLoadAndCache, key: %s, err: %v", key, err))
 			}
 		}(context.Background(), keys[i], sourceDataList[i])
 	}
 
-	return sourceDataList, nil
+	resultList := make([]T, 0, len(sourceDataList))
+	for _, val := range sourceDataList {
+		if val == nil {
+			resultList = append(resultList, zero[T]())
+			continue
+		}
+		result, ok := val.(T)
+		if !ok {
+			err = fmt.Errorf("source data is supposed to be type of %T, but got type of %T", zero[T](), val)
+			helper.Err(ctx, err)
+			return nil, err
+		}
+		resultList = append(resultList, result)
+	}
+	return resultList, nil
 }
 
 // 获取本地写锁，若超过更新间隔则重设本地元数据。（用于缓存不存在时 主动回源场景）
@@ -230,7 +280,7 @@ func (cl *CacheLoader[T]) canWMeta(key string) bool {
 	meta, ok := cl.metaCache.Get(key)
 	if !ok {
 		if cl.debug {
-			internal.Debug(context.Background(), "CLR can write meta, meta not exist")
+			helper.Debug(context.Background(), "CLR can write meta, meta not exist")
 		}
 		return true
 	}
@@ -238,12 +288,12 @@ func (cl *CacheLoader[T]) canWMeta(key string) bool {
 	m, ok := meta.(*lastWriteMeta)
 	if ok && time.Since(m.LastWriteTime) < time.Duration(cl.refreshAfterWriteSec)*time.Second {
 		if cl.debug {
-			internal.Debug(context.Background(), fmt.Sprintf("CLR can not write meta, within time, since: %v, thredsold: %v", time.Since(m.LastWriteTime), time.Duration(cl.refreshAfterWriteSec)*time.Second))
+			helper.Debug(context.Background(), fmt.Sprintf("CLR can not write meta, within time, since: %v, thredsold: %v", time.Since(m.LastWriteTime), time.Duration(cl.refreshAfterWriteSec)*time.Second))
 		}
 		return false
 	}
 	if cl.debug {
-		internal.Debug(context.Background(), "CLR can write meta")
+		helper.Debug(context.Background(), "CLR can write meta")
 	}
 
 	return true
@@ -254,7 +304,7 @@ func (cl *CacheLoader[T]) canWMeta(key string) bool {
 // @key：缓存key
 // @val：缓存值
 // @touchSource：是否需要回源
-func (cl *CacheLoader[T]) lockAndCache(ctx context.Context, key string, val T, touchSource bool) error {
+func (cl *CacheLoader[T]) lockAndCache(ctx context.Context, key string, val4Cache interface{}, touchSource bool) error {
 	// 1 抢分布式锁（时间段内互斥）
 	locked, err := cl.lockHandler.TimeLock(ctx, key, lockDuration)
 	if err != nil {
@@ -263,27 +313,27 @@ func (cl *CacheLoader[T]) lockAndCache(ctx context.Context, key string, val T, t
 	// 2 抢锁成功则更新缓存
 	if locked {
 		// cache无命中时，ttl取配置值
-		ttl := cl.getConfigTTL(val)
+		ttl := cl.getConfigTTL(val4Cache)
 		if touchSource {
 			// 3 自动更新过程需要回源
-			val, ttl, err = cl.loadAndGetTTL(ctx, key)
+			val4Cache, ttl, err = cl.loadAndGetTTL(ctx, key)
 			if err != nil {
 				return err
 			}
-			// ttl == 0 and err == nil，表示缓存已过期
+			// ttl == 0，表示缓存已过期
 			if ttl == 0 {
 				return nil
 			}
 			// 如果回源拿不到值，则写入无效值nil并设置过期时间为配置值
-			if val == nil {
-				ttl = cl.getConfigTTL(val)
+			if val4Cache == nil {
+				ttl = cl.getConfigTTL(val4Cache)
 			}
 		}
 		// 无效值过滤：待写入cache的值，如果为nil，则认为是无效值
-		if val == nil {
-			val = []byte(invalidValue)
+		if val4Cache == nil {
+			val4Cache = invalidValue
 		}
-		err = cl.cacheHandler.Set(ctx, key, val, ttl)
+		err = cl.cacheHandler.Set(ctx, key, val4Cache, ttl)
 		if err != nil {
 			return fmt.Errorf("fail to execute set, err:%v", err)
 		}
@@ -294,7 +344,7 @@ func (cl *CacheLoader[T]) lockAndCache(ctx context.Context, key string, val T, t
 // 加载数据源并获取对应缓存的TTL。
 // @ctx：上下文
 // @key：缓存key
-func (cl *CacheLoader[T]) loadAndGetTTL(ctx context.Context, key string) (T, time.Duration, error) {
+func (cl *CacheLoader[T]) loadAndGetTTL(ctx context.Context, key string) (interface{}, time.Duration, error) {
 	val, err := cl.loadHandler.Load(ctx, key)
 	if err != nil {
 		return nil, 0, fmt.Errorf("fail to execute load, err:%v", err)
@@ -306,12 +356,22 @@ func (cl *CacheLoader[T]) loadAndGetTTL(ctx context.Context, key string) (T, tim
 		}
 		ttl = cl.getConfigTTL(val)
 	}
-	return val, ttl, nil
+
+	if val == nil {
+		return nil, ttl, nil
+	}
+	result, ok := val.(T)
+	if !ok {
+		err = fmt.Errorf("source data is supposed to be type of %T, but got type of %T", zero[T](), val)
+		helper.Err(ctx, err)
+		return nil, 0, err
+	}
+	return result, ttl, nil
 }
 
-func (cl *CacheLoader[T]) getConfigTTL(val T) time.Duration {
-	if len(val) == 0 {
-		return time.Duration(cl.ttlSec4Invalid) * time.Second // 无效值的过期时间
+func (cl *CacheLoader[T]) getConfigTTL(val interface{}) time.Duration {
+	if val == nil {
+		return time.Duration(cl.ttlSec4Invalid) * time.Second
 	}
-	return time.Duration(cl.ttlSec) * time.Second // 有效值的过期时间
+	return time.Duration(cl.ttlSec) * time.Second
 }

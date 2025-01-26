@@ -11,12 +11,12 @@ import (
 const defaultMetaCacheMaxLen = 10000
 
 // 生成CacheLoader的构建器。
-func NewBuilder() *Builder {
-	return &Builder{}
+func NewBuilder[T comparable]() *Builder[T] {
+	return &Builder[T]{}
 }
 
 /************************ CacheLoader structure ************************/
-type Builder struct {
+type Builder[T comparable] struct {
 	cacheHandler         Cacher        // 缓存处理器
 	loadHandler          Loader        // 回源处理器
 	lockHandler          Locker        // 分布式锁处理器
@@ -29,54 +29,54 @@ type Builder struct {
 }
 
 // 元数据数组的最大长度
-func (builder *Builder) MetaCacheMaxLen(metaCacheMaxLen int) *Builder {
+func (builder *Builder[T]) MetaCacheMaxLen(metaCacheMaxLen int) *Builder[T] {
 	builder.metaCacheMaxLen = metaCacheMaxLen
 	return builder
 }
 
 // 距离上次写缓存后触发自动更新的最小时间间隔（单位：s）：0代表不执行自动更新
-func (builder *Builder) RefreshAfterWriteSec(refreshAfterWriteSec uint64) *Builder {
+func (builder *Builder[T]) RefreshAfterWriteSec(refreshAfterWriteSec uint64) *Builder[T] {
 	builder.refreshAfterWriteSec = refreshAfterWriteSec
 	return builder
 }
 
 // 缓存有效时长（单位：s）：0代表缓存不过期
-func (builder *Builder) TTLSec(ttlSec uint64) *Builder {
+func (builder *Builder[T]) TTLSec(ttlSec uint64) *Builder[T] {
 	builder.ttlSec = ttlSec
 	return builder
 }
 
-func (builder *Builder) TTLSec4Invalid(ttlSec4Invalid uint64) *Builder {
+func (builder *Builder[T]) TTLSec4Invalid(ttlSec4Invalid uint64) *Builder[T] {
 	builder.ttlSec4Invalid = ttlSec4Invalid
 	return builder
 }
 
-func (builder *Builder) RefreshTimeout(timeout time.Duration) *Builder {
+func (builder *Builder[T]) RefreshTimeout(timeout time.Duration) *Builder[T] {
 	builder.refreshTimeout = timeout
 	return builder
 }
 
-func (builder *Builder) RegisterCacher(cacher Cacher) *Builder {
+func (builder *Builder[T]) RegisterCacher(cacher Cacher) *Builder[T] {
 	builder.cacheHandler = cacher
 	return builder
 }
 
-func (builder *Builder) RegisterLoader(loader Loader) *Builder {
+func (builder *Builder[T]) RegisterLoader(loader Loader) *Builder[T] {
 	builder.loadHandler = loader
 	return builder
 }
 
-func (builder *Builder) RegisterLocker(locker Locker) *Builder {
+func (builder *Builder[T]) RegisterLocker(locker Locker) *Builder[T] {
 	builder.lockHandler = locker
 	return builder
 }
 
-func (builder *Builder) Debug() *Builder {
+func (builder *Builder[T]) Debug() *Builder[T] {
 	builder.debug = true
 	return builder
 }
 
-func (builder *Builder) Build() (*CacheLoader, error) {
+func (builder *Builder[T]) Build() (*CacheLoader[T], error) {
 	if builder.refreshAfterWriteSec != 0 && builder.ttlSec <= builder.refreshAfterWriteSec {
 		return nil, fmt.Errorf("refreshAfterWriteSec{%d} should be less than ttlSec{%d}", builder.refreshAfterWriteSec, builder.ttlSec)
 	}
@@ -100,7 +100,7 @@ func (builder *Builder) Build() (*CacheLoader, error) {
 		builder.metaCacheMaxLen = defaultMetaCacheMaxLen
 	}
 
-	return &CacheLoader{
+	return &CacheLoader[T]{
 		cacheHandler:         builder.cacheHandler,
 		loadHandler:          builder.loadHandler,
 		lockHandler:          builder.lockHandler,
