@@ -3,6 +3,7 @@ package cacheloader
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,19 +16,21 @@ import (
 // returns the current testing context
 type Suite struct {
 	suite.Suite
-	cacher      Cacher
-	loader      Loader
-	locker      Locker
-	cancel      context.CancelFunc
-	panicCacher Cacher
-	sleepLoader Loader
+	cacher Cacher
+	loader Loader
+	locker Locker
+	cancel context.CancelFunc
 }
 
 // Make sure that VariableThatShouldStartAtFive is set to five
 // before each test
 func (suite *Suite) SetupSuite() {
+}
+
+// The SetupTest method will be run before every test in the suite.
+func (suite *Suite) SetupTest() {
 	helper.DebugOn()
-	cImpl := &cacherImpl{KVMap: &sync.Map{}, mutex: &sync.Mutex{}}
+	cImpl := &cacherImpl{KVMap: &sync.Map{}}
 	suite.cacher = cImpl
 	suite.locker = cImpl
 	ctx, cancel := context.WithCancel(context.Background())
@@ -40,13 +43,14 @@ func (suite *Suite) SetupSuite() {
 			select {
 			case <-milSecondTimer.C:
 				cImpl.KVMap.Range(func(key, value interface{}) bool {
+					emptyTime := time.Time{}
 					rawVal := value.(*strCacheVal)
-					if rawVal.dueTime.Before(time.Now()) {
-						cImpl.mutex.Lock()
-						defer cImpl.mutex.Unlock()
+					if rawVal.dueTime != emptyTime && rawVal.dueTime.Before(time.Now()) {
+						cImpl.mutex4KVMap.Lock()
+						defer cImpl.mutex4KVMap.Unlock()
 						if value, ok := cImpl.KVMap.Load(key); ok {
 							rawVal := value.(*strCacheVal)
-							if rawVal.dueTime.Before(time.Now()) {
+							if rawVal.dueTime != emptyTime && rawVal.dueTime.Before(time.Now()) {
 								cImpl.KVMap.Delete(key)
 							}
 						}
@@ -62,20 +66,17 @@ func (suite *Suite) SetupSuite() {
 		}
 	}(ctx)
 	suite.loader = &loaderImpl{KVMap: &sync.Map{}}
-	suite.sleepLoader = &sleepLoaderImpl{KVMap: &sync.Map{}, rwLock: &sync.RWMutex{}}
-	suite.panicCacher = &panicCacherImpl{}
-}
-
-// The SetupTest method will be run before every test in the suite.
-func (suite *Suite) SetupTest() {
+	// suite.sleepLoader = &sleepLoaderImpl{KVMap: &sync.Map{}, rwLock: &sync.RWMutex{}}
+	// suite.panicCacher = &panicCacherImpl{}
 }
 
 // The TearDownTest method will be run after every test in the suite.
 func (suite *Suite) TearDownTest() {
+	helper.Err4Debug.Store(ErrEmpty)
+	suite.cancel()
 }
 
 func (suite *Suite) TearDownSuite() {
-	suite.cancel()
 }
 
 // In order for 'go test' to run this suite, we need to create
@@ -86,8 +87,9 @@ func TestSuite(t *testing.T) {
 
 /************************************************ cacherImpl structure ************************************************/
 type cacherImpl struct {
-	KVMap *sync.Map
-	mutex *sync.Mutex
+	KVMap          *sync.Map
+	mutex4KVMap    sync.Mutex
+	hitCnt, reqCnt atomic.Int32
 }
 
 type strCacheVal struct {
@@ -104,7 +106,9 @@ func (c *cacherImpl) TimeLock(_ context.Context, key string, duration time.Durat
 }
 
 func (c *cacherImpl) Get(ctx context.Context, key string) (string, error) {
+	c.reqCnt.Add(1)
 	if val, ok := c.KVMap.Load(key); ok {
+		c.hitCnt.Add(1)
 		rawVal := val.(*strCacheVal)
 		return rawVal.val, nil
 	}
@@ -112,9 +116,11 @@ func (c *cacherImpl) Get(ctx context.Context, key string) (string, error) {
 }
 
 func (c *cacherImpl) MGet(_ context.Context, keys ...string) ([]interface{}, error) {
+	c.reqCnt.Add(int32(len(keys)))
 	resultList := make([]interface{}, 0, len(keys))
 	for _, key := range keys {
 		if val, ok := c.KVMap.Load(key); ok {
+			c.hitCnt.Add(1)
 			rawVal := val.(*strCacheVal)
 			resultList = append(resultList, rawVal.val)
 			continue
@@ -124,15 +130,19 @@ func (c *cacherImpl) MGet(_ context.Context, keys ...string) ([]interface{}, err
 	return resultList, nil
 }
 
-func (c *cacherImpl) Set(_ context.Context, key string, val interface{}, ttl time.Duration) error {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
-	strVal, err := helper.JSONMarshal(val)
-	if err != nil {
-		return err
+func (c *cacherImpl) Set(_ context.Context, key string, val string, ttl time.Duration) error {
+	c.mutex4KVMap.Lock()
+	defer c.mutex4KVMap.Unlock()
+
+	if ttl == 0 {
+		c.KVMap.Store(key, &strCacheVal{
+			val:     val,
+			dueTime: time.Time{},
+		})
+		return nil
 	}
 	c.KVMap.Store(key, &strCacheVal{
-		val:     string(strVal),
+		val:     val,
 		dueTime: time.Now().Add(ttl),
 	})
 	return nil
@@ -141,14 +151,36 @@ func (c *cacherImpl) Set(_ context.Context, key string, val interface{}, ttl tim
 func (c *cacherImpl) TTL(_ context.Context, key string) (time.Duration, error) {
 	if val, ok := c.KVMap.Load(key); ok {
 		rawVal := val.(*strCacheVal)
+		emptyTime := time.Time{}
+		if rawVal.dueTime == emptyTime {
+			return 0, nil
+		}
 		return time.Until(rawVal.dueTime), nil
 	}
-	return 0, nil
+	return 0, ErrNotFound
+}
+
+func (c *cacherImpl) HitCnt() int32 {
+	return c.hitCnt.Load()
+}
+
+func (c *cacherImpl) ReqCnt() int32 {
+	return c.reqCnt.Load()
+}
+
+func (c *cacherImpl) Reset() {
+	c.hitCnt.Store(0)
+	c.reqCnt.Store(0)
+}
+
+func (c *cacherImpl) HitRate() float64 {
+	return float64(c.hitCnt.Load()) / float64(c.reqCnt.Load())
 }
 
 /************************************************ loaderImpl structure ************************************************/
 type loaderImpl struct {
-	KVMap *sync.Map
+	KVMap  *sync.Map
+	reqCnt atomic.Int32
 }
 
 func (l *loaderImpl) Load(ctx context.Context, key string) (interface{}, error) {
@@ -157,10 +189,11 @@ func (l *loaderImpl) Load(ctx context.Context, key string) (interface{}, error) 
 }
 
 func (l *loaderImpl) Loads(_ context.Context, keys ...string) ([]interface{}, error) {
+	l.reqCnt.Add(1)
 	resultList := make([]interface{}, 0, len(keys))
 	for _, key := range keys {
 		if val, ok := l.KVMap.Load(key); ok {
-			rawVal := val.(interface{})
+			rawVal := val
 			resultList = append(resultList, rawVal)
 			continue
 		}
@@ -178,7 +211,7 @@ func (l *loaderImpl) Store(_ context.Context, key string, val interface{}) error
 type sleepLoaderImpl struct {
 	KVMap        *sync.Map
 	notFirstLoad bool
-	rwLock       *sync.RWMutex
+	rwLock       sync.RWMutex
 }
 
 func (l *sleepLoaderImpl) Load(ctx context.Context, key string) (interface{}, error) {
@@ -227,7 +260,7 @@ func (l *sleepLoaderImpl) loads(_ context.Context, keys ...string) ([]interface{
 			l.notFirstLoad = true
 			l.rwLock.Unlock()
 
-			rawVal := val.(interface{})
+			rawVal := val
 			resultList = append(resultList, rawVal)
 			continue
 		}
@@ -250,7 +283,7 @@ func (c *panicCacherImpl) TimeLock(_ context.Context, _ string, _ time.Duration)
 }
 
 func (c *panicCacherImpl) Get(_ context.Context, _ string) (string, error) {
-	sample := &testStruct{}
+	sample := &TestStruct{}
 	result, err := helper.JSONMarshal(sample)
 	return string(result), err
 }
@@ -259,7 +292,7 @@ func (c *panicCacherImpl) MGet(_ context.Context, _ ...string) ([]interface{}, e
 	return []interface{}{}, nil
 }
 
-func (c *panicCacherImpl) Set(_ context.Context, _ string, _ interface{}, _ time.Duration) error {
+func (c *panicCacherImpl) Set(_ context.Context, _ string, _ string, _ time.Duration) error {
 	return nil
 }
 

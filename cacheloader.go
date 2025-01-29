@@ -264,13 +264,6 @@ func (cl *CacheLoader[T]) wLockAndResetMeta(key string) bool {
 // 优先获取本地读锁，若超过更新间隔，则升级为写锁重设本地元数据。（用于缓存存在时 自动回源场景）
 // @key：缓存key
 func (cl *CacheLoader[T]) rwLockAndResetMeta(key string) bool {
-	//cl.rwLock.RLock()
-	//if cl.canWMeta(key) {
-	//	cl.rwLock.RUnlock()
-	//	return cl.wLockAndResetMeta(key)
-	//}
-	//cl.rwLock.RUnlock()
-	//return false
 	return cl.wLockAndResetMeta(key)
 }
 
@@ -330,10 +323,19 @@ func (cl *CacheLoader[T]) lockAndCache(ctx context.Context, key string, val4Cach
 			}
 		}
 		// 无效值过滤：待写入cache的值，如果为nil，则认为是无效值
+		var val4CacheStr string
 		if val4Cache == nil {
-			val4Cache = invalidValue
+			val4CacheStr = invalidValue
+		} else {
+			tmp, err := helper.JSONMarshal(val4Cache)
+			if err != nil {
+				err = fmt.Errorf("fail to execute JSONMarshal, err:%v", err)
+				helper.Err(ctx, err)
+				return err
+			}
+			val4CacheStr = string(tmp)
 		}
-		err = cl.cacheHandler.Set(ctx, key, val4Cache, ttl)
+		err = cl.cacheHandler.Set(ctx, key, val4CacheStr, ttl)
 		if err != nil {
 			return fmt.Errorf("fail to execute set, err:%v", err)
 		}

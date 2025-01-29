@@ -77,8 +77,10 @@ func (builder *Builder[T]) Debug() *Builder[T] {
 }
 
 func (builder *Builder[T]) Build() (*CacheLoader[T], error) {
-	if builder.refreshAfterWriteSec != 0 && builder.ttlSec <= builder.refreshAfterWriteSec {
-		return nil, fmt.Errorf("refreshAfterWriteSec{%d} should be less than ttlSec{%d}", builder.refreshAfterWriteSec, builder.ttlSec)
+	if builder.refreshAfterWriteSec > 0 && builder.ttlSec > 0 &&
+		builder.ttlSec <= builder.refreshAfterWriteSec {
+		return nil, fmt.Errorf("refreshAfterWriteSec{%d} should be less than ttlSec{%d}",
+			builder.refreshAfterWriteSec, builder.ttlSec)
 	}
 	if builder.cacheHandler == nil {
 		return nil, fmt.Errorf("cacheHandler should not be nil")

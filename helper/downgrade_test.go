@@ -14,7 +14,6 @@ func (suite *Suite) TestDowngraded() {
 	for i := 0; i < 10; i++ {
 		go func() {
 			millisecondTimer := time.NewTicker(5 * time.Millisecond)
-			canceled := false
 			for {
 				select {
 				case <-millisecondTimer.C:
@@ -22,11 +21,7 @@ func (suite *Suite) TestDowngraded() {
 						total.Inc()
 					}
 				case <-cancel:
-					canceled = true
-					break
-				}
-				if canceled {
-					break
+					return
 				}
 			}
 		}()

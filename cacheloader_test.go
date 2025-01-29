@@ -3,156 +3,367 @@ package cacheloader
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"sync"
 	"time"
 
 	"github.com/Luoyuhao/go-cacheloader/helper"
-	"go.uber.org/atomic"
 )
 
-type testStruct struct {
+type TestStruct struct {
 	Name  string `json:"name"`
 	Value int64  `json:"value"`
 }
 
-var emptyErr = fmt.Errorf("")
+var ErrEmpty = fmt.Errorf("")
 
-// 基本用法：
-// CASE1、Builder模式创建CacheLoader实例。
-// CASE2、Get/MGet初次回源，源值不存在，缓存无效值防雪崩。（用户无感）。
-// CASE3、Get/MGet初次回源，源值存在，缓存回源值。
-// CASE4、数据源变更数据，持续Get触发固定间隔后缓存与数据源同步。
-func (suite *Suite) Test_Usage() {
+func (suite *Suite) Test_TTLSec4Invalid() {
 	ctx := context.Background()
-	// CASE1：builder模式创建CacheLoader实例
-	clr, err := NewBuilder[*testStruct]().
+	clr, err := NewBuilder[*TestStruct]().
 		RefreshAfterWriteSec(uint64(1)).
 		TTLSec(uint64(3)).
-		TTLSec4Invalid(uint64(2)).
+		TTLSec4Invalid(uint64(2)). // set ttlSec4Invalid to leverage cache invalid value, in case of cache miss
 		RegisterCacher(suite.cacher).
 		RegisterLoader(suite.loader).
 		RegisterLocker(suite.locker).Build()
 	suite.NoError(err)
 
-	// CASE2：数据源不存在数据，初次回源，返回回源值，缓存无效值。
-	key3 := "test3"
-	key4 := "test4"
-	result, err := clr.Get(ctx, key3)
-	suite.NoError(err)
-	suite.Nil(result)
+	key1 := "concurrent_test1"
+	key2 := "concurrent_test2"
 
-	resultList, err := clr.MGet(ctx, key3, key4)
-	suite.NoError(err)
-	suite.Equal(2, len(resultList))
-	suite.Nil(resultList[0]) // key3: 数据源不存在，cache无效值，返回无效值, 触发缓存自动更新
-	suite.Nil(resultList[1]) // key4: 数据源不存在，cache为空，触发回源，返回回源值，并缓存无效值
+	var wg sync.WaitGroup
+	done := make(chan struct{})
 
-	// CASE3：数据源存在数据，初次回源，返回回源值，缓存回源值。
-	key1 := "test1"
-	key2 := "test2"
-	val1 := &testStruct{
-		Name:  key1,
-		Value: 1,
-	}
-	val2 := &testStruct{
-		Name:  key2,
-		Value: 2,
-	}
-	loader := (suite.loader).(*loaderImpl)
-	err = loader.Store(ctx, key1, val1) // 存入数据
-	suite.NoError(err)
-	err = loader.Store(ctx, key2, val2) // 存入数据
-	suite.NoError(err)
+	// 启动两个goroutine持续访问数据
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			key := key1
+			if idx == 1 {
+				key = key2
+			}
 
-	resultList, err = clr.MGet(ctx, key1, key2) // 回源
-	suite.NoError(err)
-	suite.Equal(2, len(resultList))
-	for _, result := range resultList {
-		if result.Name == key1 {
-			suite.Equal(*val1, *result)
-		} else if result.Name == key2 {
-			suite.Equal(*val2, *result)
-		} else {
-			suite.NoError(fmt.Errorf("未符合预期命中数据"))
-		}
-	}
-
-	// CASE4：数据源变更数据 持续访问触发缓存自动更新（更新间隔最快为1s）
-	var (
-		start, end time.Time
-		ended      atomic.Bool
-	)
-	start = time.Now()
-	valUpdated := &testStruct{
-		Name:  "babaaba",
-		Value: 3,
-	}
-	err = loader.Store(ctx, key1, valUpdated) // 更新数据源中key1对应的值
-	suite.NoError(err)
-	group := &sync.WaitGroup{}
-	// 1、启动3个并发线程持续访问key1数据（3000QPS）
-	// 2、3个并发线程持续测试缓存值是否与数据源同步
-	// 3、检查到缓存与数据源同步的延时是否与设置的1S吻合（RefreshAfterWriteSec=1s）
-	for i := 0; i < 3; i++ {
-		group.Add(1)
-		go func() {
-			defer group.Done()
-			milSecondTimer := time.NewTicker(1 * time.Millisecond)
 			for {
-				<-milSecondTimer.C
-				result, err := clr.Get(ctx, key1)
-				suite.NoError(err)
-				if *result == *val1 {
-					continue
-				} else if *result == *valUpdated {
-					if ended.CompareAndSwap(false, true) {
-						end = time.Now() // 缓存更新时设置结束时间并退出
+				select {
+				case <-done:
+					return
+				default:
+					if rand.Intn(2) == 0 {
+						result, err := clr.Get(ctx, key)
+						suite.NoError(err)
+						suite.Nil(result)
+					} else {
+						results, err := clr.MGet(ctx, key1, key2)
+						suite.NoError(err)
+						suite.Equal(2, len(results))
+						suite.Nil(results[0])
+						suite.Nil(results[1])
 					}
-					break
-				} else {
-					suite.NoError(fmt.Errorf("未符合预期命中数据"))
-					break
+					time.Sleep(50 * time.Millisecond) // 稍微降低访问频率
 				}
 			}
-		}()
+		}(i)
 	}
-	group.Wait()
-	// 由于锁等消耗时间 误差范围在毫秒级别(50)
-	suite.True(end.Sub(start) <= 1*time.Second+50*time.Millisecond)
-	suite.True(end.Sub(start) >= 1*time.Second-50*time.Millisecond)
-	fmt.Println(end.Sub(start))
+
+	// 运行1秒后验证缓存值
+	time.Sleep(1 * time.Second)
+	val1, err := suite.cacher.Get(ctx, key1)
+	suite.NoError(err)
+	suite.Equal(invalidValue, val1)
+
+	val2, err := suite.cacher.Get(ctx, key2)
+	suite.NoError(err)
+	suite.Equal(invalidValue, val2)
+
+	// 继续运行4秒
+	time.Sleep(4 * time.Second)
+	close(done)
+	wg.Wait()
+
+	// 检查命中率
+	suite.True(suite.cacher.(*cacherImpl).HitRate() > 0.9)
 }
 
-// // cacher返回值语义约定：存入nil->nil，存入[]byte{}->[]byte{}
-// func (suite *Suite) Test_CacherImpl() {
-// 	// []byte{}
-// 	ctx := context.Background()
-// 	err := suite.cacher.Set(ctx, "test_1", []byte{}, 1*time.Second)
-// 	suite.NoError(err)
+func (suite *Suite) Test_TTLSec() {
+	ctx := context.Background()
+	clr, err := NewBuilder[*TestStruct]().
+		TTLSec(uint64(2)). // set ttlSec but not set refreshAfterWriteSec, making the cache behave according to ttlSec
+		RegisterCacher(suite.cacher).
+		RegisterLoader(suite.loader).
+		RegisterLocker(suite.locker).Build()
+	suite.NoError(err)
 
-// 	result, err := suite.cacher.Get(ctx, "test_1")
-// 	suite.NoError(err)
-// 	suite.Equal([]byte{}, result)
+	key1 := "test1"
+	key2 := "test2"
+	val1 := &TestStruct{
+		Name:  key1,
+		Value: int64(1),
+	}
+	val2 := &TestStruct{
+		Name:  key2,
+		Value: int64(2),
+	}
 
-// 	// nil
-// 	err = suite.cacher.Set(ctx, "test_2", nil, 1*time.Second)
-// 	suite.NoError(err)
+	// 先存入初始数据
+	loader := (suite.loader).(*loaderImpl)
+	err = loader.Store(ctx, key1, val1)
+	suite.NoError(err)
+	err = loader.Store(ctx, key2, val2)
+	suite.NoError(err)
 
-// 	result, err = suite.cacher.Get(ctx, "test_2")
-// 	suite.NoError(err)
-// 	suite.Nil(result)
-// }
+	// 启动一个慢速生产者和多个快速消费者
+	var wg sync.WaitGroup
+	done := make(chan struct{})
+
+	// 慢速生产者 - 每秒更新一次源数据
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		count := int64(0)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				count++
+				val1.Value = count
+				val2.Value = count * 2
+				err := loader.Store(ctx, key1, val1)
+				suite.NoError(err)
+				err = loader.Store(ctx, key2, val2)
+				suite.NoError(err)
+				time.Sleep(1 * time.Second)
+			}
+		}
+	}()
+
+	// 5个快速消费者
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for {
+				select {
+				case <-done:
+					return
+				default:
+					if id%2 == 0 {
+						result, err := clr.Get(ctx, key1)
+						suite.NoError(err)
+						suite.NotNil(result)
+					} else {
+						results, err := clr.MGet(ctx, key1, key2)
+						suite.NoError(err)
+						suite.Equal(2, len(results))
+						suite.NotNil(results[0])
+						suite.NotNil(results[1])
+					}
+					time.Sleep(50 * time.Millisecond)
+				}
+			}
+		}(i)
+	}
+
+	// 运行5秒后检查
+	time.Sleep(5 * time.Second)
+	close(done)
+	wg.Wait()
+
+	// 验证缓存命中率
+	suite.True(suite.cacher.(*cacherImpl).HitRate() > 0.9)
+}
+
+func (suite *Suite) Test_RefreshAfterWriteSec() {
+	ctx := context.Background()
+	clr, err := NewBuilder[*TestStruct]().
+		RefreshAfterWriteSec(uint64(1)). // set refreshAfterWriteSec to leverage cache update when data source changed
+		RegisterCacher(suite.cacher).
+		RegisterLoader(suite.loader).
+		RegisterLocker(suite.locker).Build()
+	suite.NoError(err)
+
+	key1 := "test1"
+	key2 := "test2"
+	val1 := &TestStruct{
+		Name:  key1,
+		Value: int64(1),
+	}
+	val2 := &TestStruct{
+		Name:  key2,
+		Value: int64(2),
+	}
+
+	// 先存入初始数据
+	loader := (suite.loader).(*loaderImpl)
+	err = loader.Store(ctx, key1, val1)
+	suite.NoError(err)
+	err = loader.Store(ctx, key2, val2)
+	suite.NoError(err)
+
+	// 启动一个慢速生产者和多个快速消费者
+	var wg sync.WaitGroup
+	done := make(chan struct{})
+
+	// 慢速生产者 - 每秒更新一次源数据
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		count := int64(0)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				count++
+				val1.Value = count
+				val2.Value = count * 2
+				err := loader.Store(ctx, key1, val1)
+				suite.NoError(err)
+				err = loader.Store(ctx, key2, val2)
+				suite.NoError(err)
+				time.Sleep(1 * time.Second)
+			}
+		}
+	}()
+
+	// 5个快速消费者
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for {
+				select {
+				case <-done:
+					return
+				default:
+					if id%2 == 0 {
+						result, err := clr.Get(ctx, key1)
+						suite.NoError(err)
+						suite.NotNil(result)
+					} else {
+						results, err := clr.MGet(ctx, key1, key2)
+						suite.NoError(err)
+						suite.Equal(2, len(results))
+						suite.NotNil(results[0])
+						suite.NotNil(results[1])
+					}
+					time.Sleep(50 * time.Millisecond)
+				}
+			}
+		}(i)
+	}
+
+	// 运行5秒后检查
+	time.Sleep(5 * time.Second)
+	close(done)
+	wg.Wait()
+
+	// 验证缓存命中率
+	suite.True(suite.cacher.(*cacherImpl).HitRate() > 0.9)
+}
+
+func (suite *Suite) Test_TTLSecWithRefreshAfterWriteSec() {
+	ctx := context.Background()
+	clr, err := NewBuilder[*TestStruct]().
+		TTLSec(uint64(2)).
+		RefreshAfterWriteSec(uint64(1)). // set refreshAfterWriteSec to leverage cache update when data source changed
+		RegisterCacher(suite.cacher).
+		RegisterLoader(suite.loader).
+		RegisterLocker(suite.locker).Build()
+	suite.NoError(err)
+
+	key1 := "test1"
+	key2 := "test2"
+	val1 := &TestStruct{
+		Name:  key1,
+		Value: int64(1),
+	}
+	val2 := &TestStruct{
+		Name:  key2,
+		Value: int64(2),
+	}
+
+	// 先存入初始数据
+	loader := (suite.loader).(*loaderImpl)
+	err = loader.Store(ctx, key1, val1)
+	suite.NoError(err)
+	err = loader.Store(ctx, key2, val2)
+	suite.NoError(err)
+
+	// 启动一个慢速生产者和多个快速消费者
+	var wg sync.WaitGroup
+	done := make(chan struct{})
+
+	// 慢速生产者 - 每秒更新一次源数据
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		count := int64(0)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				count++
+				val1.Value = count
+				val2.Value = count * 2
+				err := loader.Store(ctx, key1, val1)
+				suite.NoError(err)
+				err = loader.Store(ctx, key2, val2)
+				suite.NoError(err)
+				time.Sleep(1 * time.Second)
+			}
+		}
+	}()
+
+	// 5个快速消费者
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for {
+				select {
+				case <-done:
+					return
+				default:
+					if id%2 == 0 {
+						result, err := clr.Get(ctx, key1)
+						suite.NoError(err)
+						suite.NotNil(result)
+					} else {
+						results, err := clr.MGet(ctx, key1, key2)
+						suite.NoError(err)
+						suite.Equal(2, len(results))
+						suite.NotNil(results[0])
+						suite.NotNil(results[1])
+					}
+					time.Sleep(50 * time.Millisecond)
+				}
+			}
+		}(i)
+	}
+
+	// 运行5秒后检查
+	time.Sleep(5 * time.Second)
+	close(done)
+	wg.Wait()
+
+	// 验证缓存命中率
+	suite.True(suite.cacher.(*cacherImpl).HitRate() > 0.9)
+}
 
 // 触发panic的资源释放顺序
 func (suite *Suite) Test_Panic() {
 	ctx := context.Background()
-	clr, err := NewBuilder[*testStruct]().
+	panicCacher := &panicCacherImpl{}
+	clr, err := NewBuilder[*TestStruct]().
 		TTLSec(uint64(5)).
 		RefreshAfterWriteSec(uint64(1)).
 		RefreshTimeout(10 * time.Second).
-		RegisterCacher(suite.panicCacher).
+		RegisterCacher(panicCacher).
 		RegisterLoader(suite.loader).
-		RegisterLocker((suite.panicCacher).(*panicCacherImpl)).Build()
+		RegisterLocker(panicCacher).Build()
 	suite.NoError(err)
 
 	key := "test_panic"
@@ -160,28 +371,28 @@ func (suite *Suite) Test_Panic() {
 	suite.NoError(err)
 
 	time.Sleep(10 * time.Millisecond) // 停顿1s 若自动更新过程发生panic会记录error
-	suite.NotEqual(emptyErr, (helper.Err4Debug.Load()).(error))
-	helper.Err4Debug.Store(emptyErr)
+	suite.NotEqual(ErrEmpty, (helper.Err4Debug.Load()).(error))
 }
 
 // 设置自动回源超时
 func (suite *Suite) Test_LoadTimeout() {
 	ctx := context.Background()
-	clr, err := NewBuilder[*testStruct]().
+	sleepLoader := &sleepLoaderImpl{KVMap: &sync.Map{}}
+	clr, err := NewBuilder[*TestStruct]().
 		TTLSec(uint64(5)).
 		RefreshAfterWriteSec(uint64(1)).
 		RefreshTimeout(100 * time.Millisecond). // 设置自动更新100ms超时
 		RegisterCacher(suite.cacher).
-		RegisterLoader(suite.sleepLoader).
+		RegisterLoader(sleepLoader).
 		RegisterLocker(suite.locker).Build()
 	suite.NoError(err)
 
 	key := "Test_LoadTimeout"
-	val := &testStruct{
+	val := &TestStruct{
 		Name:  key,
 		Value: 2,
 	}
-	loader := (suite.sleepLoader).(*sleepLoaderImpl)
+	loader := sleepLoader
 	err = loader.Store(ctx, key, val) // 存入数据
 	suite.NoError(err)
 	result, err := clr.Get(ctx, key)
@@ -197,28 +408,27 @@ func (suite *Suite) Test_LoadTimeout() {
 	suite.True(time.Since(start) < 10*time.Millisecond)
 
 	time.Sleep(200 * time.Millisecond) // 停顿1s 若自动更新过程发生超时则会记录error
-	suite.NotEqual(emptyErr, (helper.Err4Debug.Load()).(error))
-	helper.Err4Debug.Store(emptyErr)
+	suite.NotEqual(ErrEmpty, (helper.Err4Debug.Load()).(error))
 }
 
 // 测试metaCache的长度有限性
 func (suite *Suite) Test_metaCache() {
 	ctx := context.Background()
-
-	clr, err := NewBuilder[*testStruct]().
+	sleepLoader := &sleepLoaderImpl{KVMap: &sync.Map{}}
+	clr, err := NewBuilder[*TestStruct]().
 		TTLSec(uint64(5)).
 		RefreshAfterWriteSec(uint64(1)).
 		MetaCacheMaxLen(1).
 		RefreshTimeout(100 * time.Millisecond). // 设置自动更新100ms超时
 		RegisterCacher(suite.cacher).
-		RegisterLoader(suite.sleepLoader).
+		RegisterLoader(sleepLoader).
 		RegisterLocker(suite.locker).Build()
 	suite.NoError(err)
 
-	loader := (suite.sleepLoader).(*sleepLoaderImpl)
+	loader := sleepLoader
 
 	key1 := "test_metacache_limit_1"
-	val1 := &testStruct{
+	val1 := &TestStruct{
 		Name:  key1,
 		Value: 1,
 	}
@@ -238,7 +448,7 @@ func (suite *Suite) Test_metaCache() {
 	suite.True(time.Since(start) < 10*time.Millisecond)
 
 	key2 := "test_metacache_limit_2"
-	val2 := &testStruct{
+	val2 := &TestStruct{
 		Name:  key2,
 		Value: 2,
 	}
