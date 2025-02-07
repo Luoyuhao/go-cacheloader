@@ -66,8 +66,6 @@ func (suite *Suite) SetupTest() {
 		}
 	}(ctx)
 	suite.loader = &loaderImpl{KVMap: &sync.Map{}}
-	// suite.sleepLoader = &sleepLoaderImpl{KVMap: &sync.Map{}, rwLock: &sync.RWMutex{}}
-	// suite.panicCacher = &panicCacherImpl{}
 }
 
 // The TearDownTest method will be run after every test in the suite.
