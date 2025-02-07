@@ -38,9 +38,7 @@ type lastWriteMeta struct {
 	LastWriteTime time.Time // 上次写缓存时间
 }
 
-// 查询数据。对应某个key数据不存在时，返回值为nil。
-// @ctx：上下文
-// @key：缓存keys
+// MGet get multiple cache data by keys
 func (cl *CacheLoader[T]) MGet(ctx context.Context, keys ...string) ([]T, error) {
 	if len(keys) == 0 {
 		return []T{}, nil
@@ -96,9 +94,7 @@ func (cl *CacheLoader[T]) MGet(ctx context.Context, keys ...string) ([]T, error)
 	return resultList, nil
 }
 
-// 查询数据。数据不存在时，返回值为nil。
-// @ctx：上下文
-// @key：缓存key
+// Get get cache data by key
 func (cl *CacheLoader[T]) Get(ctx context.Context, key string) (T, error) {
 	if helper.Downgraded() {
 		return zero[T](), ErrDowngraded
@@ -127,6 +123,7 @@ func (cl *CacheLoader[T]) Get(ctx context.Context, key string) (T, error) {
 	return dataList[0], nil
 }
 
+// cvtStrTypeCacheData convert string type cache data to T type, return zero of T type if cache data is nil
 func (cl *CacheLoader[T]) cvtStrTypeCacheData(ctx context.Context, cacheData interface{}) (T, error) {
 	var data T
 	switch raw := cacheData.(type) {
@@ -157,9 +154,7 @@ func (cl *CacheLoader[T]) cvtStrTypeCacheData(ctx context.Context, cacheData int
 	return zero[T](), err
 }
 
-// 触发自动更新缓存。
-// @ctx：上下文
-// @key：缓存key
+// triggerCacheRefresh trigger cache refresh
 func (cl *CacheLoader[T]) triggerCacheRefresh(ctx context.Context, key string) {
 	if cl.refreshAfterWriteSec <= 0 { // refreshAfterWriteSec为零值时不自动更新缓存
 		if cl.debug {
@@ -187,9 +182,7 @@ func (cl *CacheLoader[T]) triggerCacheRefresh(ctx context.Context, key string) {
 	}(context.Background(), key)
 }
 
-// 触发回源并设置缓存。
-// @ctx：上下文
-// @keys：缓存keys
+// triggerLoadAndCache trigger load and cache
 func (cl *CacheLoader[T]) triggerLoadAndCache(ctx context.Context, keys ...string) ([]T, error) {
 	if len(keys) == 0 {
 		return []T{}, nil
@@ -249,8 +242,7 @@ func (cl *CacheLoader[T]) triggerLoadAndCache(ctx context.Context, keys ...strin
 	return resultList, nil
 }
 
-// 获取本地写锁，若超过更新间隔则重设本地元数据。（用于缓存不存在时 主动回源场景）
-// @key：缓存key
+// wLockAndResetMeta get local write lock, reset local meta if exceed update interval. (for access source scenario when cache not exist)
 func (cl *CacheLoader[T]) wLockAndResetMeta(key string) bool {
 	cl.rwLock.Lock()
 	defer cl.rwLock.Unlock()
@@ -261,14 +253,18 @@ func (cl *CacheLoader[T]) wLockAndResetMeta(key string) bool {
 	return false
 }
 
-// 优先获取本地读锁，若超过更新间隔，则升级为写锁重设本地元数据。（用于缓存存在时 自动回源场景）
-// @key：缓存key
+// rwLockAndResetMeta get local read lock, upgrade to write lock if exceed update interval, then reset local meta. (for auto refresh scenario when cache exist)
 func (cl *CacheLoader[T]) rwLockAndResetMeta(key string) bool {
-	return cl.wLockAndResetMeta(key)
+	cl.rwLock.RLock()
+	if cl.canWMeta(key) {
+		cl.rwLock.RUnlock()
+		return cl.wLockAndResetMeta(key)
+	}
+	cl.rwLock.RUnlock()
+	return false
 }
 
-// 判断当前key是否满足重设本地元数据的条件
-// @key：缓存key
+// canWMeta judge if current key satisfies the condition to reset local meta
 func (cl *CacheLoader[T]) canWMeta(key string) bool {
 	meta, ok := cl.metaCache.Get(key)
 	if !ok {
@@ -292,11 +288,7 @@ func (cl *CacheLoader[T]) canWMeta(key string) bool {
 	return true
 }
 
-// 设置分布式锁（时间段内互斥），设置成功则更新缓存，否则直接返回。
-// @ctx：上下文
-// @key：缓存key
-// @val：缓存值
-// @touchSource：是否需要回源
+// lockAndCache set distributed lock (mutual exclusion within time), set success then update cache, otherwise return directly.
 func (cl *CacheLoader[T]) lockAndCache(ctx context.Context, key string, val4Cache interface{}, touchSource bool) error {
 	// 1 抢分布式锁（时间段内互斥）
 	locked, err := cl.lockHandler.TimeLock(ctx, key, lockDuration)
@@ -343,9 +335,7 @@ func (cl *CacheLoader[T]) lockAndCache(ctx context.Context, key string, val4Cach
 	return nil
 }
 
-// 加载数据源并获取对应缓存的TTL。
-// @ctx：上下文
-// @key：缓存key
+// loadAndGetTTL load source data and get corresponding cache ttl
 func (cl *CacheLoader[T]) loadAndGetTTL(ctx context.Context, key string) (interface{}, time.Duration, error) {
 	val, err := cl.loadHandler.Load(ctx, key)
 	if err != nil {

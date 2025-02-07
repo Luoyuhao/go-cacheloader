@@ -263,7 +263,7 @@ func (suite *Suite) Test_RefreshAfterWriteSec() {
 	suite.True(suite.cacher.(*cacherImpl).HitRate() > 0.9)
 }
 
-func (suite *Suite) Test_TTLSecWithRefreshAfterWriteSec() {
+func (suite *Suite) Test_TTLSecWithRefreshAfterWriteSec_struct() {
 	ctx := context.Background()
 	clr, err := NewBuilder[*TestStruct]().
 		TTLSec(uint64(2)).
@@ -337,6 +337,90 @@ func (suite *Suite) Test_TTLSecWithRefreshAfterWriteSec() {
 						suite.Equal(2, len(results))
 						suite.NotNil(results[0])
 						suite.NotNil(results[1])
+					}
+					time.Sleep(50 * time.Millisecond)
+				}
+			}
+		}(i)
+	}
+
+	// 运行5秒后检查
+	time.Sleep(5 * time.Second)
+	close(done)
+	wg.Wait()
+
+	// 验证缓存命中率
+	suite.True(suite.cacher.(*cacherImpl).HitRate() > 0.9)
+}
+
+func (suite *Suite) Test_TTLSecWithRefreshAfterWriteSec_int() {
+	ctx := context.Background()
+	clr, err := NewBuilder[int]().
+		TTLSec(uint64(2)).
+		RefreshAfterWriteSec(uint64(1)). // set refreshAfterWriteSec to leverage cache update when data source changed
+		RegisterCacher(suite.cacher).
+		RegisterLoader(suite.loader).
+		RegisterLocker(suite.locker).Build()
+	suite.NoError(err)
+
+	key1 := "test1"
+	key2 := "test2"
+	val1 := 1
+	val2 := 2
+
+	// 先存入初始数据
+	loader := (suite.loader).(*loaderImpl)
+	err = loader.Store(ctx, key1, val1)
+	suite.NoError(err)
+	err = loader.Store(ctx, key2, val2)
+	suite.NoError(err)
+
+	// 启动一个慢速生产者和多个快速消费者
+	var wg sync.WaitGroup
+	done := make(chan struct{})
+
+	// 慢速生产者 - 每秒更新一次源数据
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		count := 0
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				count++
+				val1 += count
+				val2 += count * 2
+				err := loader.Store(ctx, key1, val1)
+				suite.NoError(err)
+				err = loader.Store(ctx, key2, val2)
+				suite.NoError(err)
+				time.Sleep(1 * time.Second)
+			}
+		}
+	}()
+
+	// 5个快速消费者
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for {
+				select {
+				case <-done:
+					return
+				default:
+					if id%2 == 0 {
+						result, err := clr.Get(ctx, key1)
+						suite.NoError(err)
+						suite.NotEmpty(result)
+					} else {
+						results, err := clr.MGet(ctx, key1, key2)
+						suite.NoError(err)
+						suite.Equal(2, len(results))
+						suite.NotEmpty(results[0])
+						suite.NotEmpty(results[1])
 					}
 					time.Sleep(50 * time.Millisecond)
 				}
