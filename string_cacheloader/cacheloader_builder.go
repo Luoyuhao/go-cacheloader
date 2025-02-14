@@ -1,11 +1,11 @@
-package cacheloader
+package string_cacheloader
 
 import (
 	"fmt"
-	"sync"
 	"time"
 
-	"github.com/golang/groupcache/lru"
+	"github.com/Luoyuhao/go-cacheloader"
+	"github.com/Luoyuhao/go-cacheloader/internal"
 )
 
 const defaultMetaCacheMaxLen = 10000
@@ -17,15 +17,15 @@ func NewBuilder[T comparable]() *Builder[T] {
 
 /************************ CacheLoader structure ************************/
 type Builder[T comparable] struct {
-	cacheHandler         Cacher        // 缓存处理器
-	loadHandler          Loader        // 回源处理器
-	lockHandler          Locker        // 分布式锁处理器
-	refreshAfterWriteSec uint64        // 距离上次写缓存后触发自动更新的最小时间间隔（单位：s）：0代表不执行自动更新
-	ttlSec               uint64        // 缓存有效时长（单位：s）：0代表缓存不过期
-	ttlSec4Invalid       uint64        // 无效值的缓存过期时长（单位：s）
-	refreshTimeout       time.Duration // 自动更新timeout设置（默认为2s）
-	metaCacheMaxLen      int           // 元数据数组最大长度：数组长度越大，越能减少不必要的回源请求，但注意内存使用情况
-	debug                bool          // debug模式
+	cacheHandler         cacheloader.StringCacher // 缓存处理器
+	loadHandler          cacheloader.Loader       // 回源处理器
+	lockHandler          cacheloader.Locker       // 分布式锁处理器
+	refreshAfterWriteSec uint64                   // 距离上次写缓存后触发自动更新的最小时间间隔（单位：s）：0代表不执行自动更新
+	ttlSec               uint64                   // 缓存有效时长（单位：s）：0代表缓存不过期
+	ttlSec4Invalid       uint64                   // 无效值的缓存过期时长（单位：s）
+	refreshTimeout       time.Duration            // 自动更新timeout设置（默认为2s）
+	metaCacheMaxLen      int                      // 元数据数组最大长度：数组长度越大，越能减少不必要的回源请求，但注意内存使用情况
+	debug                bool                     // debug模式
 }
 
 // MetaCacheMaxLen set meta cache max length
@@ -59,19 +59,19 @@ func (builder *Builder[T]) RefreshTimeout(timeout time.Duration) *Builder[T] {
 }
 
 // RegisterCacher register cacher
-func (builder *Builder[T]) RegisterCacher(cacher Cacher) *Builder[T] {
+func (builder *Builder[T]) RegisterCacher(cacher cacheloader.StringCacher) *Builder[T] {
 	builder.cacheHandler = cacher
 	return builder
 }
 
 // RegisterLoader register loader
-func (builder *Builder[T]) RegisterLoader(loader Loader) *Builder[T] {
+func (builder *Builder[T]) RegisterLoader(loader cacheloader.Loader) *Builder[T] {
 	builder.loadHandler = loader
 	return builder
 }
 
 // RegisterLocker register locker
-func (builder *Builder[T]) RegisterLocker(locker Locker) *Builder[T] {
+func (builder *Builder[T]) RegisterLocker(locker cacheloader.Locker) *Builder[T] {
 	builder.lockHandler = locker
 	return builder
 }
@@ -109,16 +109,21 @@ func (builder *Builder[T]) Build() (*CacheLoader[T], error) {
 		builder.metaCacheMaxLen = defaultMetaCacheMaxLen
 	}
 
-	return &CacheLoader[T]{
-		cacheHandler:         builder.cacheHandler,
-		loadHandler:          builder.loadHandler,
-		lockHandler:          builder.lockHandler,
-		refreshAfterWriteSec: builder.refreshAfterWriteSec,
-		ttlSec:               builder.ttlSec,
-		ttlSec4Invalid:       builder.ttlSec4Invalid,
-		metaCache:            lru.New(builder.metaCacheMaxLen),
-		rwLock:               &sync.RWMutex{},
-		refreshTimeout:       builder.refreshTimeout,
-		debug:                builder.debug,
-	}, nil
+	bcl := internal.NewBaseCacheLoader[T](
+		builder.loadHandler,
+		builder.lockHandler,
+		builder.refreshAfterWriteSec,
+		builder.refreshTimeout,
+		builder.ttlSec4Invalid,
+		builder.metaCacheMaxLen,
+		builder.debug,
+	)
+
+	cl := &CacheLoader[T]{
+		cacheHandler:    builder.cacheHandler,
+		ttlSec:          builder.ttlSec,
+		BaseCacheLoader: bcl,
+	}
+	cl.CacheSetter = cl
+	return cl, nil
 }

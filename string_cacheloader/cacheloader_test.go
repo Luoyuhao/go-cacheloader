@@ -1,4 +1,4 @@
-package cacheloader
+package string_cacheloader
 
 import (
 	"context"
@@ -543,7 +543,7 @@ func (suite *Suite) Test_metaCache() {
 	suite.NoError(err)
 	suite.Equal(*val2, *result)
 
-	clr.rwLock.RLock()
-	suite.Equal(1, clr.metaCache.Len())
-	clr.rwLock.RUnlock()
+	clr.BaseCacheLoader.RWLock.RLock()
+	suite.Equal(1, clr.BaseCacheLoader.MetaCache.Len())
+	clr.BaseCacheLoader.RWLock.RUnlock()
 }

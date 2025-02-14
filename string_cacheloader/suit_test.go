@@ -1,4 +1,4 @@
-package cacheloader
+package string_cacheloader
 
 import (
 	"context"
@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Luoyuhao/go-cacheloader"
 	"github.com/Luoyuhao/go-cacheloader/helper"
 	"github.com/stretchr/testify/suite"
 )
@@ -16,9 +17,9 @@ import (
 // returns the current testing context
 type Suite struct {
 	suite.Suite
-	cacher Cacher
-	loader Loader
-	locker Locker
+	cacher cacheloader.StringCacher
+	loader cacheloader.Loader
+	locker cacheloader.Locker
 	cancel context.CancelFunc
 }
 
@@ -110,7 +111,7 @@ func (c *cacherImpl) Get(ctx context.Context, key string) (string, error) {
 		rawVal := val.(*strCacheVal)
 		return rawVal.val, nil
 	}
-	return "", ErrNotFound
+	return "", cacheloader.ErrNotFound
 }
 
 func (c *cacherImpl) MGet(_ context.Context, keys ...string) ([]interface{}, error) {
@@ -155,7 +156,7 @@ func (c *cacherImpl) TTL(_ context.Context, key string) (time.Duration, error) {
 		}
 		return time.Until(rawVal.dueTime), nil
 	}
-	return 0, ErrNotFound
+	return 0, cacheloader.ErrNotFound
 }
 
 func (c *cacherImpl) HitCnt() int32 {

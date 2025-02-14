@@ -5,8 +5,8 @@ import (
 	"time"
 )
 
-/************************ Cacher：缓存处理器抽象 ************************/
-type Cacher interface {
+/************************ StringCacher：String类型缓存处理器抽象 ************************/
+type StringCacher interface {
 	// Get get cache by key, return ErrNotFound if not exist
 	Get(ctx context.Context, key string) (string, error)
 
