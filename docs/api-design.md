@@ -3,6 +3,9 @@
 当前已落地 `New(backend, LoadFunc[T], Config)`，替代 Builder + Cacher/Loader/Locker 多项业务注册。
 string 与 zset 共享快照引擎和配置；业务只读，缓存写是组件内部行为。
 
+从 v1 迁移时，将 module import 前缀从 `github.com/Luoyuhao/go-cacheloader` 改为
+`github.com/Luoyuhao/go-cacheloader/v2`，包括 `string_cacheloader` 和 `memory` 等子包。
+
 | 旧设计 | 当前设计 |
 | --- | --- |
 | comparable、any 回源 | T any；带类型的 LoadFunc |

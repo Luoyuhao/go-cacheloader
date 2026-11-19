@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Luoyuhao/go-cacheloader"
-	"github.com/Luoyuhao/go-cacheloader/memory"
+	"github.com/Luoyuhao/go-cacheloader/v2"
+	"github.com/Luoyuhao/go-cacheloader/v2/memory"
 	"github.com/stretchr/testify/require"
 )
 

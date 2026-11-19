@@ -10,9 +10,9 @@ import (
     "context"
     "time"
 
-    "github.com/Luoyuhao/go-cacheloader"
-    "github.com/Luoyuhao/go-cacheloader/memory"
-    "github.com/Luoyuhao/go-cacheloader/string_cacheloader"
+    "github.com/Luoyuhao/go-cacheloader/v2"
+    "github.com/Luoyuhao/go-cacheloader/v2/memory"
+    "github.com/Luoyuhao/go-cacheloader/v2/string_cacheloader"
 )
 
 // 示例业务类型可以包含 slice/map，不需要 comparable。
@@ -71,7 +71,8 @@ users, err := string_cacheloader.New(backend, repo.LoadUser, cfg,
 | 内存后端 | `memory.New(capacity)`，带 LRU、TTL、原子条件替换 |
 | 自定义后端 | 实现 StringCacher 的 Get / CompareAndSwap；两种 loader 共用 |
 
-这是不兼容升级：移除 Builder、StringLoader/Loads、Locker、全局限流配置及 zset 增删接口。
+v2 的模块路径是 `github.com/Luoyuhao/go-cacheloader/v2`。从 v1 迁移时需要更新 import 路径和调用方式。
+v2 移除了 Builder、StringLoader/Loads、Locker、全局限流配置及 zset 增删接口。
 采用 `LoadFunc[T] + Config`；旧缓存原始 JSON/哨兵不兼容新 envelope，迁移时更换 key 前缀。
 Redis 适配器尚未随库提供；适配器必须原子完成值比较、写入和 TTL 设置，不能用独立 GET + SET 模拟。
 

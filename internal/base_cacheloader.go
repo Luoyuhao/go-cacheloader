@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Luoyuhao/go-cacheloader"
+	"github.com/Luoyuhao/go-cacheloader/v2"
 )
 
 type snapshot[T any] struct {

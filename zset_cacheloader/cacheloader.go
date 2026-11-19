@@ -9,8 +9,8 @@ import (
 	"sort"
 	"unicode/utf8"
 
-	"github.com/Luoyuhao/go-cacheloader"
-	"github.com/Luoyuhao/go-cacheloader/string_cacheloader"
+	"github.com/Luoyuhao/go-cacheloader/v2"
+	"github.com/Luoyuhao/go-cacheloader/v2/string_cacheloader"
 )
 
 type LoadFunc func(context.Context, string) ([]cacheloader.Z, error)

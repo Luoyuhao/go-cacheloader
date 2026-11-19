@@ -1,4 +1,4 @@
-module github.com/Luoyuhao/go-cacheloader
+module github.com/Luoyuhao/go-cacheloader/v2
 
 go 1.23.2
 

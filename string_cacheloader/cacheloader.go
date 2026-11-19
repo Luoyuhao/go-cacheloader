@@ -5,8 +5,8 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/Luoyuhao/go-cacheloader"
-	"github.com/Luoyuhao/go-cacheloader/internal"
+	"github.com/Luoyuhao/go-cacheloader/v2"
+	"github.com/Luoyuhao/go-cacheloader/v2/internal"
 )
 
 type CacheLoader[T any] struct{ reader *internal.Reader[T] }

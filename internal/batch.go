@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/Luoyuhao/go-cacheloader"
+	"github.com/Luoyuhao/go-cacheloader/v2"
 )
 
 // readMany returns one cache observation per key. Failed/partial native batch

@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Luoyuhao/go-cacheloader"
+	"github.com/Luoyuhao/go-cacheloader/v2"
 	"github.com/stretchr/testify/require"
 )
 
