@@ -1,218 +1,430 @@
+// Package internal implements the shared read-only snapshot lifecycle.
 package internal
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
+	"reflect"
 	"sync"
 	"time"
 
 	"github.com/Luoyuhao/go-cacheloader"
-	"github.com/Luoyuhao/go-cacheloader/helper"
-	"github.com/golang/groupcache/lru"
 )
 
-const (
-	lockDuration = 300 * time.Millisecond
-)
-
-func Zero[T any]() T {
-	var zero T
-	return zero
+type snapshot[T any] struct {
+	Version   int       `json:"version"`
+	Revision  string    `json:"revision"`
+	WrittenAt time.Time `json:"written_at"`
+	Found     bool      `json:"found"`
+	Value     T         `json:"value"`
 }
 
-type CacheSetter interface {
-	SetCache(ctx context.Context, key string, val interface{}, touchSource bool) error
+type flight struct {
+	done chan struct{}
+	raw  string
+	err  error
 }
 
-type BaseCacheLoader[T comparable] struct {
-	CacheSetter
-	LoadHandler          cacheloader.Loader // 回源处理器
-	LockHandler          cacheloader.Locker // 分布式锁处理器
-	RefreshAfterWriteSec uint64             // 距离上次写缓存后触发自动更新的最小时间间隔（单位：s）：0代表不执行自动更新
-	RefreshTimeout       time.Duration      // 自动更新timeout设置（默认为2s）
-	TTLSec4Invalid       uint64             // 无效值的缓存有效时长(单位：s)
-	MetaCache            *lru.Cache         // 带LRU淘汰机制的cache, 存储上次写缓存的元数据
-	RWLock               sync.RWMutex       // 用于控制metaMap读写
-	Debug                bool               // debug模式
+type Reader[T any] struct {
+	cache         cacheloader.StringCacher
+	load          cacheloader.LoadFunc[T]
+	batch         cacheloader.BatchLoadFunc[T]
+	cfg           cacheloader.Config
+	mu            sync.Mutex
+	flights       map[string]*flight
+	closed        bool
+	root          context.Context
+	cancel        context.CancelFunc
+	wg            sync.WaitGroup
+	requestWindow time.Time
+	requests      int
 }
 
-type lastWriteMeta struct {
-	LastWriteTime time.Time // 上次写缓存时间
-}
-
-func NewBaseCacheLoader[T comparable](
-	loadHandler cacheloader.Loader,
-	lockHandler cacheloader.Locker,
-	refreshAfterWriteSec uint64,
-	refreshTimeout time.Duration,
-	ttlSec4Invalid uint64,
-	metaCacheMaxLen int,
-	debug bool,
-) *BaseCacheLoader[T] {
-	bcl := &BaseCacheLoader[T]{
-		LoadHandler:          loadHandler,
-		LockHandler:          lockHandler,
-		RefreshAfterWriteSec: refreshAfterWriteSec,
-		RefreshTimeout:       refreshTimeout,
-		TTLSec4Invalid:       ttlSec4Invalid,
-		MetaCache:            lru.New(metaCacheMaxLen),
-		Debug:                debug,
+func NewReader[T any](cache cacheloader.StringCacher, load cacheloader.LoadFunc[T], cfg cacheloader.Config, batch cacheloader.BatchLoadFunc[T]) (*Reader[T], error) {
+	if cache == nil || load == nil {
+		return nil, fmt.Errorf("cacheloader: cache and load function are required")
 	}
-	bcl.CacheSetter = bcl
-	return bcl
-}
-
-// TriggerCacheRefresh trigger cache refresh
-func (cl *BaseCacheLoader[T]) TriggerCacheRefresh(ctx context.Context, key string) {
-	if cl.RefreshAfterWriteSec <= 0 { // RefreshAfterWriteSec为零值时不自动更新缓存
-		if cl.Debug {
-			helper.Debug(ctx, "CLR no need to trigger cache refresh")
-		}
-		return
-	}
-
-	go func(ctx context.Context, key string) {
-		timeoutCtx, cancel := context.WithTimeout(ctx, cl.RefreshTimeout)
-		helper.AskForToken()
-		defer helper.RecoverAndLog(timeoutCtx)
-		defer func() {
-			cancel()
-			helper.ReturnToken()
-		}()
-		ok := cl.RWLockAndResetMeta(key)
-		if !ok {
-			return
-		}
-		err := cl.LockAndCache(timeoutCtx, key, Zero[T](), true)
-		if err != nil {
-			helper.Warn(timeoutCtx, fmt.Errorf("CacheLoader fail to set cache when triggerCacheRefresh, key: %s, err: %v", key, err))
-		}
-	}(context.Background(), key)
-}
-
-// TriggerLoadAndCache trigger load and cache
-func (cl *BaseCacheLoader[T]) TriggerLoadAndCache(ctx context.Context, keys ...string) ([]T, error) {
-	if len(keys) == 0 {
-		return []T{}, nil
-	}
-	// 回源
-	sourceDataList := make([]interface{}, 0)
-	var err error
-	if len(keys) == 1 {
-		sourceData, err := cl.LoadHandler.Load(ctx, keys[0])
-		if err != nil {
-			return nil, err
-		}
-		sourceDataList = append(sourceDataList, sourceData)
-	} else {
-		sourceDataList, err = cl.LoadHandler.Loads(ctx, keys...)
-		if err != nil {
-			return nil, err
-		}
-		if len(sourceDataList) != len(keys) {
-			err = fmt.Errorf("lenght of result list, returned by Loads in Loader implement, did not match length of keys param, please checkout implement gideline")
-			helper.Err(ctx, err)
-			return nil, err
+	v := reflect.ValueOf(cache)
+	switch v.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
+		if v.IsNil() {
+			return nil, fmt.Errorf("cacheloader: cache must not be typed nil")
 		}
 	}
 
-	// 异步设置缓存
-	for i := 0; i < len(sourceDataList); i++ {
-		go func(ctx context.Context, key string, val interface{}) {
-			helper.AskForToken()
-			defer helper.RecoverAndLog(ctx)
-			defer helper.ReturnToken()
-			ok := cl.WLockAndResetMeta(key)
-			if !ok {
-				return
-			}
-			err := cl.LockAndCache(ctx, key, val, false)
-			if err != nil {
-				helper.Warn(ctx, fmt.Errorf("CacheLoader fail to set cache when triggerLoadAndCache, key: %s, err: %v", key, err))
-			}
-		}(context.Background(), keys[i], sourceDataList[i])
-	}
-
-	resultList := make([]T, 0, len(sourceDataList))
-	for _, val := range sourceDataList {
-		if val == nil {
-			resultList = append(resultList, Zero[T]())
-			continue
-		}
-		result, ok := val.(T)
-		if !ok {
-			err = fmt.Errorf("source data is supposed to be type of %T, but got type of %T", Zero[T](), val)
-			helper.Err(ctx, err)
-			return nil, err
-		}
-		resultList = append(resultList, result)
-	}
-	return resultList, nil
-}
-
-// WLockAndResetMeta get local write lock, reset local meta if exceed update interval.
-func (cl *BaseCacheLoader[T]) WLockAndResetMeta(key string) bool {
-	cl.RWLock.Lock()
-	defer cl.RWLock.Unlock()
-	if cl.CanWMeta(key) {
-		cl.MetaCache.Add(key, &lastWriteMeta{LastWriteTime: time.Now()})
-		return true
-	}
-	return false
-}
-
-// RWLockAndResetMeta get local read lock, upgrade to write lock if exceed update interval, then reset local meta.
-func (cl *BaseCacheLoader[T]) RWLockAndResetMeta(key string) bool {
-	cl.RWLock.RLock()
-	if cl.CanWMeta(key) {
-		cl.RWLock.RUnlock()
-		return cl.WLockAndResetMeta(key)
-	}
-	cl.RWLock.RUnlock()
-	return false
-}
-
-// CanWMeta judge if current key satisfies the condition to reset local meta
-func (cl *BaseCacheLoader[T]) CanWMeta(key string) bool {
-	meta, ok := cl.MetaCache.Get(key)
-	if !ok {
-		if cl.Debug {
-			helper.Debug(context.Background(), "CLR can write meta, meta not exist")
-		}
-		return true
-	}
-
-	m, ok := meta.(*lastWriteMeta)
-	if ok && time.Since(m.LastWriteTime) < time.Duration(cl.RefreshAfterWriteSec)*time.Second {
-		if cl.Debug {
-			helper.Debug(context.Background(), fmt.Sprintf("CLR can not write meta, within time, since: %v, thredsold: %v", time.Since(m.LastWriteTime), time.Duration(cl.RefreshAfterWriteSec)*time.Second))
-		}
-		return false
-	}
-	if cl.Debug {
-		helper.Debug(context.Background(), "CLR can write meta")
-	}
-
-	return true
-}
-
-// LockAndCache set distributed lock (mutual exclusion within time), set success then update cache, otherwise return directly.
-func (cl *BaseCacheLoader[T]) LockAndCache(ctx context.Context, key string, val4Cache interface{}, touchSource bool) error {
-	// 1 抢分布式锁（时间段内互斥）
-	locked, err := cl.LockHandler.TimeLock(ctx, key, lockDuration)
+	cfg, err := cfg.WithDefaults()
 	if err != nil {
-		return fmt.Errorf("fail to execute time lock, err:%v", err)
+		return nil, err
 	}
-	// 2 抢锁成功则更新缓存
-	if locked {
-		err = cl.CacheSetter.SetCache(ctx, key, val4Cache, touchSource)
-		if err != nil {
-			return err
-		}
+	root, cancel := context.WithCancel(context.Background())
+	return &Reader[T]{cache: cache, load: load, batch: batch, cfg: cfg, flights: make(map[string]*flight), root: root, cancel: cancel}, nil
+}
+
+// Close rejects new reads, cancels source work and waits for all admitted work.
+// Backends and source functions must honor context for Close to finish promptly.
+func (r *Reader[T]) Close() error {
+	r.mu.Lock()
+	r.closed = true
+	r.cancel()
+	r.mu.Unlock()
+	r.wg.Wait()
+	return nil
+}
+
+func (r *Reader[T]) check(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return cacheloader.ErrClosed
 	}
 	return nil
 }
 
-func (cl *BaseCacheLoader[T]) SetCache(_ context.Context, _ string, _ interface{}, _ bool) error {
-	return fmt.Errorf("to be override")
+func (r *Reader[T]) Get(ctx context.Context, key string) (value T, found bool, err error) {
+	if err = r.admit(ctx); err != nil {
+		return
+	}
+	return r.get(ctx, key)
+}
+
+func (r *Reader[T]) admit(ctx context.Context) error {
+	if err := r.check(ctx); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return cacheloader.ErrClosed
+	}
+	if r.cfg.RequestsPerSecond == 0 {
+		return nil
+	}
+	now := time.Now()
+	if now.Sub(r.requestWindow) >= time.Second {
+		r.requestWindow = now
+		r.requests = 0
+	}
+	if r.requests >= r.cfg.RequestsPerSecond {
+		return cacheloader.ErrDowngraded
+	}
+	r.requests++
+	return nil
+}
+
+func (r *Reader[T]) get(ctx context.Context, key string) (value T, found bool, err error) {
+	if err = r.check(ctx); err != nil {
+		return
+	}
+	cacheCtx, cancel := context.WithTimeout(ctx, r.cfg.CacheTimeout)
+	stop := context.AfterFunc(r.root, cancel)
+	raw, cacheErr := safe(func() (string, error) { return r.cache.Get(cacheCtx, key) })
+	if cacheErr == nil {
+		cacheErr = cacheCtx.Err()
+	}
+	stop()
+	cancel()
+	if err = r.check(ctx); err != nil {
+		return
+	}
+	var previous *string
+	if cacheErr == nil {
+		previous = &raw
+		entry, decodeErr := decode[T](raw)
+		if decodeErr == nil {
+			if r.cfg.RefreshAfter > 0 && time.Since(entry.WrittenAt) >= r.cfg.RefreshAfter {
+				_, _ = r.start(ctx, key, previous) // optional refresh never delays a hit
+			}
+			return entry.Value, entry.Found, nil
+		}
+		r.report(ctx, decodeErr)
+	} else if !errors.Is(cacheErr, cacheloader.ErrNotFound) {
+		r.report(ctx, cacheErr)
+	}
+	f, startErr := r.start(ctx, key, previous)
+	if startErr != nil {
+		return value, false, startErr
+	}
+	select {
+	case <-ctx.Done():
+		return value, false, ctx.Err()
+	case <-r.root.Done():
+		return value, false, cacheloader.ErrClosed
+	case <-f.done:
+		if err = r.check(ctx); err != nil {
+			return
+		}
+		if f.err != nil {
+			return value, false, f.err
+		}
+		entry, e := decode[T](f.raw)
+		return entry.Value, entry.Found, e
+	}
+}
+
+// start joins same-key work, reserving all new keys before spawning work.
+func (r *Reader[T]) start(ctx context.Context, key string, previous *string) (*flight, error) {
+	flights, err := r.startGroup(ctx, []request{{key: key, previous: previous}}, false)
+	if err != nil {
+		return nil, err
+	}
+	return flights[key], nil
+}
+
+type request struct {
+	key      string
+	previous *string
+}
+type work struct {
+	request
+	f *flight
+}
+
+func (r *Reader[T]) startGroup(ctx context.Context, requests []request, useBatch bool) (map[string]*flight, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nil, cacheloader.ErrClosed
+	}
+	newCount := 0
+	for _, req := range requests {
+		if r.flights[req.key] == nil {
+			newCount++
+		}
+	}
+	if len(r.flights)+newCount > r.cfg.MaxConcurrency {
+		return nil, cacheloader.ErrDowngraded
+	}
+	flights := make(map[string]*flight, len(requests))
+	owned := make([]work, 0, newCount)
+	for _, req := range requests {
+		f := r.flights[req.key]
+		if f == nil {
+			f = &flight{done: make(chan struct{})}
+			r.flights[req.key] = f
+			owned = append(owned, work{request: req, f: f})
+		}
+		flights[req.key] = f
+	}
+	if len(owned) > 0 {
+		r.wg.Add(1)
+		go r.runGroup(context.WithoutCancel(ctx), owned, useBatch)
+	}
+	return flights, nil
+}
+
+func (r *Reader[T]) runGroup(parent context.Context, owned []work, useBatch bool) {
+	defer r.wg.Done()
+	var groupErr error
+	defer func() {
+		if p := recover(); p != nil {
+			groupErr = fmt.Errorf("cacheloader: source panic: %v", p)
+		}
+		if groupErr != nil {
+			r.report(parent, groupErr)
+		}
+		for _, w := range owned {
+			if w.f.raw == "" && w.f.err == nil {
+				w.f.err = groupErr
+			} else if w.f.err != nil {
+				r.report(parent, fmt.Errorf("load snapshot %q: %w", w.key, w.f.err))
+			}
+		}
+		r.mu.Lock()
+		for _, w := range owned {
+			delete(r.flights, w.key)
+			close(w.f.done)
+		}
+		r.mu.Unlock()
+	}()
+	ctx, cancel := context.WithCancel(parent)
+	stop := context.AfterFunc(r.root, cancel)
+	defer stop()
+	defer cancel()
+	// Recheck after reserving the keys: another flight may have filled a key
+	// between our initial cache read and admission. Native batching is preserved.
+	keys := make([]string, len(owned))
+	for i, w := range owned {
+		keys[i] = w.key
+	}
+	current := r.readMany(ctx, keys, useBatch)
+	if err := ctx.Err(); err != nil {
+		groupErr = err
+		return
+	}
+	pending := make([]work, 0, len(owned))
+	loadKeys := make([]string, 0, len(owned))
+	for i, w := range owned {
+		item := current[i]
+		if item.Found && (w.previous == nil || item.Value != *w.previous) {
+			if _, err := decode[T](item.Value); err == nil {
+				w.f.raw = item.Value
+				continue
+			}
+		}
+		pending = append(pending, w)
+		loadKeys = append(loadKeys, w.key)
+	}
+	if len(pending) == 0 {
+		return
+	}
+	loadCtx, loadCancel := context.WithTimeout(ctx, r.cfg.LoadTimeout)
+	defer loadCancel()
+	values := make([]cacheloader.Result[T], len(pending))
+	batched := useBatch && r.batch != nil
+	if batched {
+		values, groupErr = r.batch(loadCtx, append([]string(nil), loadKeys...))
+		if groupErr == nil {
+			groupErr = loadCtx.Err()
+		}
+		if groupErr != nil {
+			return
+		}
+		if len(values) != len(pending) {
+			groupErr = fmt.Errorf("cacheloader: batch loader returned %d results for %d keys", len(values), len(pending))
+			return
+		}
+	} else {
+		// A single-key callback yields a result only for its own flight.
+		for i, w := range pending {
+			values[i], w.f.err = safe(func() (cacheloader.Result[T], error) {
+				if err := loadCtx.Err(); err != nil {
+					return cacheloader.Result[T]{}, err
+				}
+				value, found, err := r.load(loadCtx, w.key)
+				if err == nil {
+					err = loadCtx.Err()
+				}
+				return cacheloader.Result[T]{Value: value, Found: found}, err
+			})
+		}
+	}
+	loadCancel()
+	// Validate every result from a native batch before publishing any of it.
+	// With single-key callbacks, encoding failures belong to their own flight.
+	encoded := make([]string, len(values))
+	for i, w := range pending {
+		if w.f.err != nil {
+			continue
+		}
+		raw, err := safe(func() (string, error) { return encode(values[i]) })
+		if err != nil {
+			if batched {
+				groupErr = err
+				return
+			}
+			w.f.err = err
+			continue
+		}
+		encoded[i] = raw
+	}
+	for i, w := range pending {
+		w.f.raw = encoded[i]
+	}
+	// Conditional writes stay per-key, sharing a bounded write-stage budget.
+	writeCtx, writeCancel := context.WithTimeout(ctx, r.cfg.CacheTimeout)
+	defer writeCancel()
+	for i, w := range pending {
+		if w.f.err != nil {
+			continue
+		}
+		ttl := r.cfg.TTL
+		if !values[i].Found {
+			ttl = r.cfg.NegativeTTL
+		}
+		_, err := safe(func() (bool, error) {
+			if err := writeCtx.Err(); err != nil {
+				return false, err
+			}
+			return r.cache.CompareAndSwap(writeCtx, w.key, w.previous, encoded[i], ttl)
+		})
+		if err == nil {
+			err = writeCtx.Err()
+		}
+		if err != nil {
+			r.report(ctx, fmt.Errorf("cache write %q: %w", w.key, err))
+		}
+	}
+}
+
+func encode[T any](item cacheloader.Result[T]) (string, error) {
+	if !item.Found {
+		var zero T
+		item.Value = zero
+	}
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return "", err
+	}
+	entry := snapshot[T]{Version: 1, Revision: hex.EncodeToString(id[:]), WrittenAt: time.Now(), Found: item.Found, Value: item.Value}
+	raw, err := json.Marshal(entry)
+	if err != nil {
+		return "", fmt.Errorf("encode snapshot: %w", err)
+	}
+	if _, err := decode[T](string(raw)); err != nil {
+		return "", err
+	}
+	return string(raw), nil
+}
+
+func decode[T any](raw string) (entry snapshot[T], err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("cacheloader: JSON decode panic: %v", p)
+		}
+	}()
+	// The writer always includes both fields. RawMessage distinguishes an
+	// absent value from an explicit JSON null belonging to a valid nil value.
+	wire := struct {
+		*snapshot[T]
+		Found *bool           `json:"found"`
+		Value json.RawMessage `json:"value"`
+	}{snapshot: &entry}
+	if err = json.Unmarshal([]byte(raw), &wire); err != nil {
+		return entry, fmt.Errorf("decode snapshot: %w", err)
+	}
+	if entry.Version != 1 || entry.Revision == "" || entry.WrittenAt.IsZero() || entry.WrittenAt.After(time.Now()) {
+		return entry, fmt.Errorf("decode snapshot: invalid metadata")
+	}
+	if wire.Found == nil || wire.Value == nil {
+		return entry, fmt.Errorf("decode snapshot: required found or value field missing or invalid")
+	}
+	if err = json.Unmarshal(wire.Value, &entry.Value); err != nil {
+		return entry, fmt.Errorf("decode snapshot: %w", err)
+	}
+	entry.Found = *wire.Found
+	if !entry.Found {
+		var zero T
+		entry.Value = zero
+	}
+	return entry, nil
+}
+
+func safe[T any](fn func() (T, error)) (v T, err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("cacheloader: callback panic: %v", p)
+		}
+	}()
+	return fn()
+}
+
+func (r *Reader[T]) report(ctx context.Context, err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			slog.ErrorContext(ctx, "cacheloader observer panic", "panic", p)
+		}
+	}()
+	if r.cfg.OnError != nil {
+		r.cfg.OnError(ctx, err)
+	} else {
+		slog.WarnContext(ctx, "cacheloader", "error", err)
+	}
 }

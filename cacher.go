@@ -5,18 +5,29 @@ import (
 	"time"
 )
 
-/************************ StringCacher：String类型缓存处理器抽象 ************************/
+// StringCacher stores opaque, complete snapshots. Implementations must honor
+// context cancellation. The loader owns the wire format and key namespace.
 type StringCacher interface {
-	// Get get cache by key, return ErrNotFound if not exist
-	Get(ctx context.Context, key string) (string, error)
+	// Get returns ErrNotFound for missing or expired keys.
+	Get(context.Context, string) (string, error)
+	// CompareAndSwap atomically checks the current live value and replaces it.
+	// previous=nil matches ONLY a missing/expired key; otherwise the exact live
+	// value must match. On mismatch return false, nil. TTL=0 means no expiration.
+	// An expired key must never match a non-nil previous value.
+	CompareAndSwap(ctx context.Context, key string, previous *string, value string, ttl time.Duration) (bool, error)
+}
 
-	// MGet get multiple cache by keys, return nil if not exist
-	MGet(ctx context.Context, keys ...string) ([]interface{}, error)
+// Z identifies a member in an ordered snapshot. Members must be valid UTF-8
+// and scores must be finite.
+// Equal scores are ordered by Member's bytewise lexicographic order.
+type Z struct {
+	Score  float64 `json:"score"`
+	Member string  `json:"member"`
+}
 
-	// Set set cache by key, val and ttl
-	Set(ctx context.Context, key string, val string, ttl time.Duration) error
-
-	// TTL get ttl by key. Always return 0 to make Cacheloader consider cache is expired and make cache refresh invalid, since auto-refresh process only update cache content until cache is expired.
-	// return ErrNotSupported when cache middleware not support TTL, Cacheloader will set cache with ttl of CacheLoader setting.
-	TTL(ctx context.Context, key string) (time.Duration, error)
+// BatchStringCacher is an optional capability detected by MGet. Results must
+// match the requested keys in length and order; Found=false denotes a miss.
+// Any error invalidates the entire response (including partial results).
+type BatchStringCacher interface {
+	MGet(ctx context.Context, keys ...string) ([]Result[string], error)
 }
