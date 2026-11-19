@@ -1,5 +1,5 @@
 set_env=GOMODPROXY="https://goproxy.cn,https://proxy.golang.org,direct" GOPRIVATE="*.everphoto.cn"
-local_package=github.com/Luoyuhao/go-cacheloader
+local_package=github.com/Luoyuhao/go-cacheloader/v2
 
 .PHONY: lint
 .PHONY: test
