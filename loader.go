@@ -2,15 +2,17 @@ package cacheloader
 
 import "context"
 
-/************************ Loader：回源处理器抽象 ************************/
-type Loader interface {
-	// 回源加载数据。（不存在时返回nil）
-	// @ctx：上下文
-	// @key：用于缓存的key（回源时自行将key映射到数据源查询）
-	Load(ctx context.Context, key string) ([]byte, error)
+// LoadFunc reads the authoritative source. found distinguishes absence from a
+// valid zero/nil value. It must be read-only and honor context cancellation.
+type LoadFunc[T any] func(context.Context, string) (value T, found bool, err error)
 
-	// 回源加载数据，结果集长度与keys参数长度一致。（对于单个元素：不存在时返回nil）
-	// @ctx：上下文
-	// @key：用于缓存的keys（回源时自行将keys映射到数据源查询）
-	Loads(ctx context.Context, keys ...string) ([][]byte, error)
+// Result is one positional result of MGet.
+type Result[T any] struct {
+	Value T
+	Found bool
 }
+
+// BatchLoadFunc optionally loads distinct keys in a single source operation.
+// Return exactly one positional result per key, using Found=false for absence.
+// An error invalidates the entire batch. Like LoadFunc, this must be read-only.
+type BatchLoadFunc[T any] func(ctx context.Context, keys []string) ([]Result[T], error)
