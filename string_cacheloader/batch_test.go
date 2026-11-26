@@ -340,6 +340,58 @@ func TestBatchRefresh(t *testing.T) {
 	}, time.Second, time.Millisecond)
 }
 
+func TestBatchSyncRefreshPreservesMissPriority(t *testing.T) {
+	ctx := context.Background()
+	m := mem(t)
+	seedStaleSnapshot(t, m, "a", "1")
+	seedStaleSnapshot(t, m, "b", "2")
+	boom := errors.New("source failed")
+	var batches [][]string
+	cl := reader(t, m, func(context.Context, string) (int, bool, error) {
+		return 0, false, errors.New("unexpected single-key load")
+	}, cacheloader.Config{RefreshAfter: 30 * time.Second, SyncRefresh: true}, WithBatchLoader(func(_ context.Context, keys []string) ([]cacheloader.Result[int], error) {
+		batches = append(batches, keys)
+		if keys[0] == "cold" {
+			return []cacheloader.Result[int]{{Value: 3, Found: true}}, nil
+		}
+		return nil, boom
+	}))
+
+	rows, err := cl.MGet(ctx, "a", "cold", "b", "a")
+	require.NoError(t, err)
+	require.Equal(t, [][]string{{"cold"}, {"a", "b"}}, batches)
+	require.Equal(t, []cacheloader.Result[int]{
+		{Value: 1, Found: true}, {Value: 3, Found: true}, {Value: 2, Found: true}, {Value: 1, Found: true},
+	}, rows)
+	rows, err = cl.MGet(ctx, "a", "missing")
+	require.ErrorIs(t, err, boom)
+	require.Nil(t, rows)
+	require.Equal(t, [][]string{{"cold"}, {"a", "b"}, {"missing"}}, batches)
+}
+
+func TestBatchSyncRefreshUsesNewResultsPerKey(t *testing.T) {
+	m := mem(t)
+	seedStaleSnapshot(t, m, "updated", "1")
+	seedStaleSnapshot(t, m, "failed", "2")
+	seedStaleSnapshot(t, m, "deleted", "3")
+	cl := reader(t, m, func(_ context.Context, key string) (int, bool, error) {
+		switch key {
+		case "failed":
+			return 0, false, errors.New("source failed")
+		case "deleted":
+			return 0, false, nil
+		default:
+			return 4, true, nil
+		}
+	}, cacheloader.Config{RefreshAfter: 30 * time.Second, SyncRefresh: true})
+
+	rows, err := cl.MGet(context.Background(), "updated", "failed", "deleted", "updated")
+	require.NoError(t, err)
+	require.Equal(t, []cacheloader.Result[int]{
+		{Value: 4, Found: true}, {Value: 2, Found: true}, {Found: false}, {Value: 4, Found: true},
+	}, rows)
+}
+
 func TestBatchCacheErrorDiscardsValidPartialData(t *testing.T) {
 	m := mem(t)
 	seed := reader(t, m, func(context.Context, string) (int, bool, error) { return 99, true, nil }, cacheloader.Config{})

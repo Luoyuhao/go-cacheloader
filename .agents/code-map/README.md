@@ -8,8 +8,8 @@
 | 泛型回源与批量结果 | loader.go：LoadFunc、BatchLoadFunc、Result | string_cacheloader/cacheloader_test.go |
 | 配置/默认值/错误 | config.go、errors.go | TestCloseAndValidation |
 | string 业务入口 | string_cacheloader/cacheloader.go：New/Get/MGet/Close | string_cacheloader/cacheloader_test.go |
-| 共享快照、CAS、超时、同 key 合并、准入、关闭 | internal/base_cacheloader.go：Reader | string_cacheloader/cacheloader_test.go |
-| MGet 分批、可选批量 IO、结果校验与共享在途状态 | internal/batch.go、string_cacheloader/cacheloader.go：WithBatchLoader | string_cacheloader/batch_test.go |
+| 共享快照、同步刷新、CAS、超时、同 key 合并、准入、关闭 | internal/base_cacheloader.go：Reader | string_cacheloader/cacheloader_test.go |
+| MGet 分批、批量刷新、可选批量 IO、结果校验与共享在途状态 | internal/batch.go、string_cacheloader/cacheloader.go：WithBatchLoader | string_cacheloader/batch_test.go |
 | zset 完整快照、规范化排序、范围、基数 | zset_cacheloader/cacheloader.go：New/Get/ZRange/ZCard/Close | zset_cacheloader/cacheloader_test.go |
 | 内存 LRU/TTL/CAS 后端 | memory/cache.go | memory/cache_test.go |
 | JSON 辅助工具 | helper/json.go | helper/json_test.go |

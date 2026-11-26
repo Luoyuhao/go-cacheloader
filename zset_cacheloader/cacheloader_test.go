@@ -95,6 +95,36 @@ func TestRefreshReplacesEntireSnapshot(t *testing.T) {
 	version.Store(2)
 	require.Eventually(t, func() bool { n, e := cl.ZCard(context.Background(), "k"); return e == nil && n == 1 }, time.Second, time.Millisecond)
 }
+
+func TestSyncRefreshAppliesToSnapshotViews(t *testing.T) {
+	ctx := context.Background()
+	m, err := memory.New(10)
+	require.NoError(t, err)
+	ok, err := m.CompareAndSwap(ctx, "ranking", nil,
+		`{"version":1,"revision":"old","written_at":"2000-01-01T00:00:00Z","found":true,"value":[{"member":"old","score":1}]}`, 0)
+	require.NoError(t, err)
+	require.True(t, ok)
+	var calls int
+	want := []cacheloader.Z{{Member: "new", Score: 2}}
+	cl, err := New(m, func(context.Context, string) ([]cacheloader.Z, error) {
+		calls++
+		if calls == 1 {
+			return nil, errors.New("source failed")
+		}
+		return want, nil
+	}, cacheloader.Config{RefreshAfter: 30 * time.Second, SyncRefresh: true, OnError: func(context.Context, error) {}})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = cl.Close() })
+
+	rows, err := cl.ZRange(ctx, "ranking", 0, 0, false)
+	require.NoError(t, err)
+	require.Equal(t, []cacheloader.Z{{Member: "old", Score: 1}}, rows)
+	rows, err = cl.ZRange(ctx, "ranking", 0, 0, false)
+	require.NoError(t, err)
+	require.Equal(t, want, rows)
+	require.Equal(t, 2, calls)
+}
+
 func TestInvalidScoresAndSourceError(t *testing.T) {
 	for _, score := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
 		cl := newTest(t, func(context.Context, string) ([]cacheloader.Z, error) {

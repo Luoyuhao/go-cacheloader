@@ -135,37 +135,55 @@ func (r *Reader[T]) get(ctx context.Context, key string) (value T, found bool, e
 		return
 	}
 	var previous *string
+	var fallback *snapshot[T]
 	if cacheErr == nil {
 		previous = &raw
 		entry, decodeErr := decode[T](raw)
 		if decodeErr == nil {
-			if r.cfg.RefreshAfter > 0 && time.Since(entry.WrittenAt) >= r.cfg.RefreshAfter {
-				_, _ = r.start(ctx, key, previous) // optional refresh never delays a hit
+			if r.cfg.RefreshAfter == 0 || time.Since(entry.WrittenAt) < r.cfg.RefreshAfter {
+				return entry.Value, entry.Found, nil
 			}
-			return entry.Value, entry.Found, nil
+			if !r.cfg.SyncRefresh {
+				_, _ = r.start(ctx, key, previous)
+				return entry.Value, entry.Found, nil
+			}
+			fallback = &entry
+		} else {
+			r.report(ctx, decodeErr)
 		}
-		r.report(ctx, decodeErr)
 	} else if !errors.Is(cacheErr, cacheloader.ErrNotFound) {
 		r.report(ctx, cacheErr)
 	}
-	f, startErr := r.start(ctx, key, previous)
-	if startErr != nil {
-		return value, false, startErr
+	f, err := r.start(ctx, key, previous)
+	if err == nil {
+		if err = r.waitForFlight(ctx, f); err != nil {
+			return value, false, err
+		}
+		if f.err == nil {
+			entry, decodeErr := decode[T](f.raw)
+			return entry.Value, entry.Found, decodeErr
+		}
+		err = f.err
+	} else if !errors.Is(err, cacheloader.ErrDowngraded) {
+		return value, false, err
 	}
+	if fallback == nil {
+		return value, false, err
+	}
+	if stateErr := r.check(ctx); stateErr != nil {
+		return value, false, stateErr
+	}
+	return fallback.Value, fallback.Found, nil
+}
+
+func (r *Reader[T]) waitForFlight(ctx context.Context, f *flight) error {
 	select {
 	case <-ctx.Done():
-		return value, false, ctx.Err()
+		return ctx.Err()
 	case <-r.root.Done():
-		return value, false, cacheloader.ErrClosed
+		return cacheloader.ErrClosed
 	case <-f.done:
-		if err = r.check(ctx); err != nil {
-			return
-		}
-		if f.err != nil {
-			return value, false, f.err
-		}
-		entry, e := decode[T](f.raw)
-		return entry.Value, entry.Found, e
+		return r.check(ctx)
 	}
 }
 

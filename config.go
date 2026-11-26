@@ -9,9 +9,12 @@ import (
 // Config is copied by New. Zero durations select defaults except TTL and
 // RefreshAfter: zero TTL means no expiration, zero RefreshAfter disables refresh.
 type Config struct {
-	TTL            time.Duration
-	NegativeTTL    time.Duration
-	RefreshAfter   time.Duration
+	TTL          time.Duration
+	NegativeTTL  time.Duration
+	RefreshAfter time.Duration
+	// SyncRefresh waits for refreshes on cache hits and serves the observed
+	// snapshot if refresh fails. RefreshAfter must be positive to enable it.
+	SyncRefresh    bool
 	LoadTimeout    time.Duration
 	CacheTimeout   time.Duration
 	MaxConcurrency int

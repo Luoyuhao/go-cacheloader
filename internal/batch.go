@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/Luoyuhao/go-cacheloader/v2"
@@ -105,19 +106,36 @@ func (r *Reader[T]) MGet(ctx context.Context, keys ...string) ([]cacheloader.Res
 		}
 		for _, req := range misses {
 			f := flights[req.key]
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-r.root.Done():
-				return nil, cacheloader.ErrClosed
-			case <-f.done:
-				if err := r.check(ctx); err != nil {
+			if err := r.waitForFlight(ctx, f); err != nil {
+				return nil, err
+			}
+			if f.err != nil {
+				return nil, f.err
+			}
+			rawByKey[req.key] = f.raw
+		}
+	}
+	// Refresh only after all misses finish so refreshes cannot take their slots.
+	if r.cfg.SyncRefresh {
+		for batch := range slices.Chunk(refreshes, size) {
+			if err := r.check(ctx); err != nil {
+				return nil, err
+			}
+			flights, err := r.startGroup(ctx, batch, true)
+			if errors.Is(err, cacheloader.ErrDowngraded) {
+				continue
+			}
+			if err != nil {
+				return nil, err
+			}
+			for _, req := range batch {
+				f := flights[req.key]
+				if err := r.waitForFlight(ctx, f); err != nil {
 					return nil, err
 				}
-				if f.err != nil {
-					return nil, f.err
+				if f.err == nil {
+					rawByKey[req.key] = f.raw
 				}
-				rawByKey[req.key] = f.raw
 			}
 		}
 	}
@@ -132,10 +150,10 @@ func (r *Reader[T]) MGet(ctx context.Context, keys ...string) ([]cacheloader.Res
 		}
 		out = append(out, cacheloader.Result[T]{Value: entry.Value, Found: entry.Found})
 	}
-	// Defer optional refresh until ALL foreground chunks finish, otherwise
-	// refreshing a hit in the first chunk could starve a miss in a later chunk.
-	for offset := 0; offset < len(refreshes); offset += size {
-		_, _ = r.startGroup(ctx, refreshes[offset:min(offset+size, len(refreshes))], true)
+	if !r.cfg.SyncRefresh {
+		for batch := range slices.Chunk(refreshes, size) {
+			_, _ = r.startGroup(ctx, batch, true)
+		}
 	}
 	return out, nil
 }

@@ -40,7 +40,8 @@ func example(ctx context.Context) error {
 ```
 
 同一实例的同 key 回源合并；源并发在启动任务前限额。缓存读写故障不妨碍返回成功的源读取。
-刷新命中先返回旧快照，后台加载并原子替换，成功后重置 TTL；TTL=0 表示不过期且仍允许刷新。
+刷新默认在后台执行。设置 `RefreshAfter: 30 * time.Second, SyncRefresh: true` 后，满 30 秒的快照命中会等待回源。成功返回新值，失败返回本次读到的旧快照。
+底层 `TTL` 应长于刷新间隔以保留兜底快照，也可设为 `0` 让普通快照不过期。成功刷新并写入后重置 TTL。
 每次读取返回独立 JSON 解码结果；缓存类型/结构升级时使用新的 key 命名空间。
 
 ## 可选批量接入
@@ -57,7 +58,7 @@ users, err := string_cacheloader.New(backend, repo.LoadUser, cfg,
 后端额外实现 `BatchStringCacher.MGet(ctx, keys...) ([]Result[string], error)` 后，组件自动批量读缓存。
 缓存和源的批量能力可以独立启用；未提供的一侧回退到单 key 调用。memory 后端已支持批量读取。
 默认 BatchSize=100，并受 MaxConcurrency 限制；一次 MGet 只计一次请求限流。
-缓存批量响应失败/长度不符时丢弃该响应并回源；源批量错误/长度不符则返回错误，不负缓存。
+缓存批量响应失败或长度不符时丢弃该响应并回源。源批量失败时，冷读返回错误，同步刷新使用原快照。
 回填仍逐 key CAS，并非多 key 写入事务。详细超时和并发语义见 [string 契约](docs/string.md)。
 
 ## 功能与边界

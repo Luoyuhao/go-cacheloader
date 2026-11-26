@@ -266,6 +266,58 @@ func TestRefreshEmptyAndFailureRetry(t *testing.T) {
 		return err == nil && !found
 	}, time.Second, time.Millisecond)
 }
+
+func seedStaleSnapshot(t *testing.T, cache cacheloader.StringCacher, key, valueJSON string) string {
+	t.Helper()
+	raw := `{"version":1,"revision":"old","written_at":"2000-01-01T00:00:00Z","found":true,"value":` + valueJSON + `}`
+	ok, err := cache.CompareAndSwap(context.Background(), key, nil, raw, 0)
+	require.NoError(t, err)
+	require.True(t, ok)
+	return raw
+}
+
+func TestSyncRefreshReturnsOldValueOnFailureAndRetries(t *testing.T) {
+	ctx := context.Background()
+	m := mem(t)
+	old := seedStaleSnapshot(t, m, "stale", "1")
+	boom := errors.New("source failed")
+	var calls int
+	cl := reader(t, m, func(ctx context.Context, key string) (int, bool, error) {
+		if key != "stale" {
+			return 0, false, boom
+		}
+		calls++
+		switch calls {
+		case 1:
+			return 0, false, boom
+		case 2:
+			<-ctx.Done()
+			return 0, false, ctx.Err()
+		default:
+			return 2, true, nil
+		}
+	}, cacheloader.Config{RefreshAfter: 30 * time.Second, SyncRefresh: true, LoadTimeout: 50 * time.Millisecond})
+
+	for range 2 {
+		value, found, err := cl.Get(ctx, "stale")
+		require.NoError(t, err)
+		require.True(t, found)
+		require.Equal(t, 1, value)
+		raw, err := m.Get(ctx, "stale")
+		require.NoError(t, err)
+		require.Equal(t, old, raw)
+	}
+	for range 2 {
+		value, found, err := cl.Get(ctx, "stale")
+		require.NoError(t, err)
+		require.True(t, found)
+		require.Equal(t, 2, value)
+	}
+	require.Equal(t, 3, calls)
+	_, _, err := cl.Get(ctx, "missing")
+	require.ErrorIs(t, err, boom)
+}
+
 func TestLateRefreshCannotOverwriteOrResurrect(t *testing.T) {
 	for _, expire := range []bool{false, true} {
 		t.Run(map[bool]string{false: "replacement", true: "expiry"}[expire], func(t *testing.T) {
